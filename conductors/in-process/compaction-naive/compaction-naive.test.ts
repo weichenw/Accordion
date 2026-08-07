@@ -26,8 +26,8 @@
  * and "a user block in the middle" describe blocks below exercise mixed-kind fixtures directly.
  */
 import { describe, expect, it } from "vitest";
-import { TestHost } from "../../conductor/testhost";
-import type { Block, BlockKind } from "../../types";
+import { TestHost } from "../../../core/conductor/testhost";
+import type { Block, BlockKind } from "../../../core/types";
 import { COMPACTION_SYSTEM, NaiveCompactionConductor } from "./compaction-naive";
 
 const BUDGET = 1000; // TRIGGER (0.9) high-water mark = 900 tokens
@@ -408,7 +408,7 @@ describe("NaiveCompactionConductor — all block kinds are swallowed (main parit
 
 describe("NaiveCompactionConductor — output-token reservation (external review round, P1-7)", () => {
 	// PORT FIDELITY §6 (see compaction-naive.ts banner): `launchCompletion` now reserves output room
-	// against `view.contextWindow`, mirroring `core/conductors/handoff/handoff.ts`'s identical fix
+	// against `view.contextWindow`, mirroring `conductors/in-process/handoff/handoff.ts`'s identical fix
 	// (and its `handoff.test.ts` "middle branch"/"decline path" tests below, adapted to this
 	// conductor's own system prompt/prompt shape and constants — MAX_SUMMARY_TOKENS(8000),
 	// MIN_SUMMARY_TOKENS(1000), OUTPUT_SAFETY_MARGIN(512)).
@@ -487,6 +487,42 @@ describe("NaiveCompactionConductor — output-token reservation (external review
 
 		expect(host.completeLog.length).toBe(1);
 		expect(host.completeLog[0].maxOutputTokens).toBe(8000); // MAX_SUMMARY_TOKENS, flat behavior unchanged
+	});
+});
+
+// Model-window budget clamp fix (defense in depth): the 90%-high-water trigger must key off
+// `cap = min(budget, contextWindow)`, not `budget` alone — a mid-session swap to a smaller-window
+// model can otherwise leave `budget` oversized for a hook tick (the extension's own clamp is the
+// primary fix; this is the conductor keying off the real ceiling regardless).
+describe("NaiveCompactionConductor — trigger keys off min(budget, contextWindow) (model-window budget clamp fix, defense in depth)", () => {
+	/** Text padded to `tokens * 4` chars so `estTokens(text) ≈ tokens` — mirrors `paddedBlock` in the
+	 *  output-token-reservation describe block above (scoped there, so redefined here). */
+	function paddedBlock(id: string, order: number, tokens: number): Block {
+		return mkBlock(id, order, "text", tokens, `${id} ` + "x".repeat(tokens * 4));
+	}
+
+	it("fires at ~30k visible tokens under budget 200_000 / contextWindow 32_000 — only true because the cap is min(budget, contextWindow), not budget alone", () => {
+		const host = new TestHost();
+		host.setBudget(200_000);
+		host.setProtect(0); // whole session ages in immediately
+		host.appendBlocks(Array.from({ length: 30 }, (_, i) => paddedBlock(idOf(i), i, 1000))); // 30 * 1000 = 30_000 raw tokens
+		host.truth.setContextWindow(32_000); // cap = min(200_000, 32_000) = 32_000 → 90% high-water = 28_800 ≤ 30_000 visible
+
+		const conductor = new NaiveCompactionConductor();
+		conductor.attach(host);
+
+		host.commitTurn();
+
+		// Pre-fix, the cap was `budget` alone (200_000); 90% = 180_000 ≫ 30_000 visible, so this would
+		// never trigger at all — `completeLog` stays empty AND no status is ever set (the "not yet
+		// triggered" path calls `setStatus(null)`, not a message). Post-fix, the 90% mark against the
+		// REAL ceiling (32_000) is crossed, so the conductor DOES attempt a run — but a ~32k window is
+		// too tight to reserve useful output for a ~30k-token input, so it declines with a visible,
+		// sticky status rather than silence. That decline is the proof the trigger actually fired.
+		expect(host.completeLog.length).toBe(0); // triggered, then declined — never actually sent
+		const last = host.statusLog[host.statusLog.length - 1];
+		expect(last?.text).toMatch(/needs a bigger window/i); // windowTooTightMessage — only reachable once triggered
+		expect(host.truth.groups.length).toBe(0); // no ops emitted either way
 	});
 });
 

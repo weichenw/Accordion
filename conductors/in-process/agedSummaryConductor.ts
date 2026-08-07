@@ -1,5 +1,5 @@
 /*
- * core/conductors/agedSummaryConductor.ts — shared base for the "aged region → one LLM-written
+ * conductors/in-process/agedSummaryConductor.ts — shared base for the "aged region → one LLM-written
  * summary group" conductor shape, factored out of `compaction-naive/compaction-naive.ts` and
  * `handoff/handoff.ts` (PR #82 adversarial review: the two were ~90% duplicated — same
  * agedRegion/foreignGroupedIds/emit-group/launch-completion machinery and the same output-token
@@ -23,8 +23,8 @@
  * No Svelte, no `$state`, no engine imports. Types only from `../conductor/contract` and
  * `../conductor/view`.
  */
-import { ViewConductor, type Command, type ConductorView } from "../conductor/view";
-import type { ConductorHost, LockName, ViewBlock } from "../conductor/contract";
+import { ViewConductor, type Command, type ConductorView } from "../../core/conductor/view";
+import type { ConductorHost, LockName, ViewBlock } from "../../core/conductor/contract";
 
 /** Fraction of budget at which a run triggers (high-water mark). Shared by both conductors. */
 const TRIGGER = 0.9;
@@ -301,7 +301,12 @@ export abstract class AgedSummaryConductor extends ViewConductor {
 		// RAW baseline: Σ full token cost over EVERY block (aged or protected).
 		const rawTotal = sumTokens(view.blocks);
 		const visible = rawTotal - savedTokens;
-		const overThreshold = visible >= view.budget * TRIGGER;
+		// Trigger on the EFFECTIVE cap, not raw budget: a mid-session swap to a smaller-window model
+		// can leave `budget` oversized relative to `contextWindow` for one hook tick (the extension
+		// clamps it back down, but defense in depth here means this conductor never depends on that
+		// happening first). Never widens the cap — a known, smaller window only ever tightens it.
+		const cap = view.contextWindow != null ? Math.min(view.budget, view.contextWindow) : view.budget;
+		const overThreshold = visible >= cap * TRIGGER;
 
 		// What is genuinely new since the last successful completion.
 		const newlyAged = aged.filter((b) => !this.coveredIds.has(b.id));
