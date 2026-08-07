@@ -110,13 +110,22 @@
  *    visibly shift (expected downward) on a session's first post-upgrade observation. Bumped so a
  *    pre-v19 peer (which has none of this vocabulary) cannot pair with a v19 host/client that
  *    assumes it.
+ *  - v20: calibration coverage frontier (issue #102). A provider receipt's multiplier now applies
+ *    only through the last block order on the exact departing wire it measured; blocks appended
+ *    afterward remain raw estimates until a later receipt covers them. `SnapshotState` and config
+ *    events carry `calibrationThroughOrder`; snapshots also carry `systemPromptCalibrated` so a
+ *    prompt changed after the last receipt remains raw. Bumped because older peers would apply k to
+ *    every newly appended block and recreate the transient context spike.
+ *  - v21: every advertised conductor carries required-capability readiness. Unavailable
+ *    conductors remain visible with a reason/remediation, while hosts reject stale or forged
+ *    selection commands for them before disturbing the current conductor (issue #105).
  */
 import type { Actor, Group, Override } from "./types";
 import type { LockName } from "./locks";
 import { sanitizeOps, type Op, type OpResult } from "./ops";
 
 /** Bump on any breaking change to the message shapes below. */
-export const PROTOCOL_VERSION = 19;
+export const PROTOCOL_VERSION = 21;
 
 /**
  * The DOOR: a fixed, well-known loopback port that exactly ONE extension binds at a time as an
@@ -193,9 +202,18 @@ export interface SessionMetaWire {
 }
 
 /**
- * One entry in the available-conductor catalog the host advertises (Phase C). This is the SINGLE
- * source of truth for the GUI's conductor picker — the host, not the GUI, knows what conductors
- * exist (in-process built-ins, an attached remote SDK) and what each one claims.
+ * Whether a conductor's REQUIRED capabilities can start on this host. Optional capabilities that
+ * have a contract-preserving fallback (Thermocline's attention probe is the reference case) do not
+ * make a conductor unavailable; their degradation is surfaced after attach via conductorStatus.
+ */
+export type ConductorReadiness =
+	| { state: "ready" }
+	| { state: "unavailable"; reason: string; remediation?: string };
+
+/**
+ * One entry in the conductor catalog the host advertises (Phase C). This is the SINGLE source of
+ * truth for the GUI's conductor picker — including entries that exist but are unavailable on this
+ * install, so the picker can explain the prerequisite before selection.
  */
 export interface ActiveConductorMeta {
 	id: string;
@@ -206,6 +224,8 @@ export interface ActiveConductorMeta {
 	holdWireUpToMs: number;
 	/** True iff this conductor runs out-of-process over the wire (a remote SDK), not in-extension. */
 	remote: boolean;
+	/** Host-computed readiness of the conductor's required startup capabilities. */
+	readiness: ConductorReadiness;
 }
 
 /**
@@ -269,11 +289,15 @@ export interface SnapshotState {
 	 * The current provider-anchored calibration multiplier (`Truth.calibration`, v18) — see the
 	 * protocol History note above and ADR 0025. Optional so a peer/test constructing a `SnapshotState`
 	 * literal without it still type-checks (the v18 version bump is the real cross-version gate, same
-	 * treatment as v15's `carriedSent`); a hydrating replica defaults it to `1` (the cold-start value),
-	 * and the host serializer always emits it. DISPLAY-only — losing it on a stale peer just falls
-	 * back to the safe default, never a decision-affecting silent divergence.
+	 * treatment as v15's `carriedSent`); the host serializer always emits it. Since stage 2 it is
+	 * decision-bearing, and v20 treats it atomically with `calibrationThroughOrder`: a stale literal
+	 * missing the frontier falls back to k=1 rather than applying a global multiplier.
 	 */
 	calibration?: number;
+	/** Last block order covered by `calibration`, or `null` before the first usable receipt (v20). */
+	calibrationThroughOrder?: number | null;
+	/** Whether the current system prompt was covered by that same receipt (v20). */
+	systemPromptCalibrated?: boolean;
 	/**
 	 * The current effective system prompt (`Truth.systemPrompt`, v19, issue #93) — see the protocol
 	 * History note above. Optional AND nullable: a peer/test literal without the field still
@@ -308,6 +332,8 @@ export type WireEvent =
 			contextWindow?: number | null;
 			protectTokens?: number;
 			calibration?: number;
+			calibrationThroughOrder?: number;
+			systemPromptCalibrated?: boolean;
 			systemPrompt?: { text: string; tokens: number };
 			rev: number;
 	  }
@@ -324,8 +350,8 @@ export interface HelloMessage {
 	sessionId?: string;
 	role: Role;
 	meta: SessionMetaWire;
-	/** The available-conductor catalog (Phase C) — omitted/undefined on a host with none attached
-	 *  or not yet advertising one; the GUI picker renders from this, never from local knowledge. */
+	/** The conductor catalog (Phase C), including unavailable entries with setup guidance. Optional
+	 *  for compatibility with hand-built test peers; the GUI renders only from host knowledge. */
 	conductors?: ActiveConductorMeta[];
 	/** The current global controller lease (v16, ADR 0024), or `null` when no lease exists. Optional
 	 *  so a pre-v16-shaped literal still type-checks (the version bump is the real cross-version gate);

@@ -3,7 +3,7 @@
  *
  * The truth moved into the extension: it hosts an in-process `Truth` per session (core/truth.ts —
  * the same class the app once ran). pi's `context` hook is a LOCAL operation against that Truth —
- * NO 250ms GUI plan round trip. A client (the GUI) is a REPLICA + remote control over protocol v12.
+ * NO 250ms GUI plan round trip. A client (the GUI) is a REPLICA + remote control over protocol v21.
  *
  * Per-hook loop (all local, no disk I/O, no await on any client):
  *   1. reconcile pi's `event.messages` against the Truth by a cheap durable-id walk. If it is our
@@ -74,8 +74,9 @@ import {
 	type ControllerInfo,
 } from "../core/protocol";
 import { LiveConductorHost, type SpawnedRunner } from "../core/conductor/liveHost";
-import { catalogMeta } from "../core/conductor/registry";
+import { catalogMeta, type RegistryEntry } from "../core/conductor/registry";
 import type { CompletionRequest, CompletionResult } from "../core/conductor/contract";
+import { conductorReadiness, resolveRunnerPath as resolveConductorRunnerPath } from "./conductorReadiness";
 import {
 	REGISTRY_PROTOCOL,
 	REGISTRY_DIR,
@@ -487,11 +488,14 @@ export default function accordionLive(pi: ExtensionAPI, dependencies: RuntimeDep
 	// there because that is the one place both "what we estimated" and "what actually got sent" are
 	// known together. `maybeObserveCalibration` (called from `ingestFinishedMessage`, so it covers
 	// both `message_end` and the `agent_end` backstop) pairs it against the resulting assistant
-	// message's REAL provider usage and raw-snaps `truth.calibration`. `lastRealTokens`/
+	// message's REAL provider usage and raw-snaps `truth.calibration`. The captured block-order
+	// frontier makes that k apply only to blocks actually present on this departing wire (issue #102),
+	// never to assistant/tool blocks appended before the receipt arrives. `lastRealTokens`/
 	// `lastEstWireTokens` are the raw ingredients of the most recent observation, surfaced on
 	// `telemetryMsg()` (protocol v18) so the GUI/smoke tests can audit calibration independently of
 	// the derived multiplier.
 	let pendingWireEst: number | null = null;
+	let pendingCalibrationThroughOrder: number | null = null;
 	let lastRealTokens: number | null = null;
 	let lastEstWireTokens: number | null = null;
 
@@ -571,33 +575,31 @@ export default function accordionLive(pi: ExtensionAPI, dependencies: RuntimeDep
 			if (ws && ws.readyState === 1) send(ws, m);
 		},
 		mintToken: () => crypto.randomBytes(16).toString("hex"),
+		readiness: readinessOf,
 		spawnRunner,
 		runCompletion,
 		spawnEnv: () => ({ port, sessionKey: sessionId, home: HOME }),
 		now: () => Date.now(),
 	});
 
-	/** Resolve a spawn conductor's runner file on disk (repo checkout only this phase), or null.
-	 *  `entryFile` is relative to `conductors/ws/` (registry contract) — sanitized here so a
-	 *  malformed catalog entry can never resolve outside that directory. */
+	const conductorsWsDir = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", "conductors", "ws");
+
+	/** Required-capability readiness shared by hello metadata and host-side selection enforcement. */
+	function readinessOf(entry: RegistryEntry) {
+		return conductorReadiness(entry, conductorsWsDir);
+	}
+
+	/** Resolve a sanitized spawn runner path. Module requirements are checked separately above. */
 	function resolveRunnerPath(entryFile: string): string | null {
-		try {
-			if (typeof entryFile !== "string" || entryFile.length === 0) return null;
-			if (path.isAbsolute(entryFile) || entryFile.split(/[\\/]/).includes("..")) return null;
-			const here = path.dirname(fileURLToPath(import.meta.url));
-			const p = path.resolve(here, "..", "conductors", "ws", entryFile);
-			return fs.existsSync(p) ? p : null;
-		} catch {
-			return null;
-		}
+		return resolveConductorRunnerPath(conductorsWsDir, entryFile);
 	}
 
 	/**
 	 * Launch a spawn conductor's runner in its own Node process (NOT detached, so it dies with pi),
 	 * piping stderr into a bounded buffer surfaced via `conductorStatus` on an unexpected exit. The
 	 * returned handle's `kill()` sends SIGTERM first, SIGKILL on a second call — the grace loop lives
-	 * in `LiveConductorHost`. Returns null when the runner file is absent (thermocline then simply
-	 * doesn't appear in the catalog, and a defensive `select` of it undoes cleanly).
+	 * in `LiveConductorHost`. Returns null when the runner disappears after readiness was checked;
+	 * selection then fails transactionally without acquiring locks.
 	 */
 	function spawnRunner(entryFile: string, env: Record<string, string>): SpawnedRunner | null {
 		const runnerPath = resolveRunnerPath(entryFile);
@@ -1896,9 +1898,9 @@ export default function accordionLive(pi: ExtensionAPI, dependencies: RuntimeDep
 		// v16: re-read the controller lease from disk so this client's hello carries the current lease
 		// (and any external change it reveals is broadcast to already-connected clients).
 		refreshControllerNow();
-		// hello advertises the conductor catalog (thermocline only if its runner resolves on disk) plus
-		// the current controller lease (v16).
-		send(ws, { type: "hello", protocolVersion: PROTOCOL_VERSION, sessionId, role, meta, conductors: catalogMeta((entryFile) => resolveRunnerPath(entryFile) !== null), controller: controllerInfo() });
+		// hello advertises every conductor with host-computed required-capability readiness, plus the
+		// current controller lease (v16). Optional degradation remains a runtime status concern.
+		send(ws, { type: "hello", protocolVersion: PROTOCOL_VERSION, sessionId, role, meta, conductors: catalogMeta(readinessOf), controller: controllerInfo() });
 		sendSnapshot(ws);
 		// P1-6: a freshly attached REMOTE conductor gets an initial turn-committed right AFTER its
 		// snapshot — by now the spawned SDK has hydrated its replica and run `conductor.attach`, so its
@@ -2138,6 +2140,13 @@ export default function accordionLive(pi: ExtensionAPI, dependencies: RuntimeDep
 		const isDivergence = truth !== null;
 		buildTruth(messages);
 		if (isDivergence) {
+			// `Truth.rebuildFrom` intentionally drops the old receipt frontier: inserted/reordered blocks
+			// make it ambiguous. Drop its pending/audit ingredients too so telemetry cannot advertise an
+			// observation the rebuilt Truth no longer applies (issue #102).
+			pendingWireEst = null;
+			pendingCalibrationThroughOrder = null;
+			lastRealTokens = null;
+			lastEstWireTokens = null;
 			rebuilds++;
 			sendSnapshot();
 			// The Truth object was replaced — an in-process conductor rebuilds its tracked desired
@@ -2233,7 +2242,8 @@ export default function accordionLive(pi: ExtensionAPI, dependencies: RuntimeDep
 	/**
 	 * Issue #11 stage 1 (ADR 0025): pair the wire estimate the most recent `context` hook recorded
 	 * (`pendingWireEst`) against THIS message's REAL provider usage (assistant messages only), and
-	 * raw-snap `truth.calibration = real / est` — no clamp, no smoothing (owner-approved v1 policy:
+	 * raw-snap `truth.calibration = real / est` through that wire's captured block frontier — no
+	 * clamp, no smoothing (owner-approved v1 policy:
 	 * the dial always reflects the latest observation, never a running average). `pendingWireEst` is
 	 * consumed (cleared) unconditionally on every call — including a non-assistant message, an
 	 * aborted/errored reply, or one with no usable `usage` — so a departing wire that never yields a
@@ -2262,8 +2272,10 @@ export default function accordionLive(pi: ExtensionAPI, dependencies: RuntimeDep
 	function maybeObserveCalibration(msg: unknown): void {
 		if (!truth) return;
 		const est = pendingWireEst;
+		const throughOrder = pendingCalibrationThroughOrder;
 		pendingWireEst = null;
-		if (est === null || est <= 0) return;
+		pendingCalibrationThroughOrder = null;
+		if (est === null || est <= 0 || throughOrder === null) return;
 		const m = msg as { role?: string; stopReason?: string; usage?: RealUsage } | null | undefined;
 		if (!m || m.role !== "assistant" || !m.usage) return;
 		if (m.stopReason === "aborted" || m.stopReason === "error") return;
@@ -2275,7 +2287,7 @@ export default function accordionLive(pi: ExtensionAPI, dependencies: RuntimeDep
 		if (real <= 0) return;
 		lastRealTokens = real;
 		lastEstWireTokens = est;
-		truth.setCalibration(real / est);
+		truth.setCalibration(real / est, throughOrder);
 	}
 
 	/**
@@ -2354,6 +2366,7 @@ export default function accordionLive(pi: ExtensionAPI, dependencies: RuntimeDep
 		// assistant reply against a stale estimate, or report a stale realTokens/estWireTokens in
 		// telemetry for a session that has not yet observed anything of its own.
 		pendingWireEst = null;
+		pendingCalibrationThroughOrder = null;
 		lastRealTokens = null;
 		lastEstWireTokens = null;
 		// Issue #93 review fix: prompt capture is session-scoped. `refreshFromCtx` is deliberately
@@ -2488,9 +2501,13 @@ export default function accordionLive(pi: ExtensionAPI, dependencies: RuntimeDep
 				// folding is armed (never diverges from the wire, by the same invariant every other
 				// group/fold accounting relies on); `fullTokens()` is the raw unfolded size when folding
 				// is off (passthrough — `ret` stays undefined, `event.messages` departs verbatim).
+				// Capture the current last order alongside the estimate. `sentThroughOrder` cannot stand in
+				// for this: sent-ness advances in `finally` before the receipt, while this frontier must stay
+				// pinned to the exact wire being measured (issue #102).
 				// Recorded regardless of whether any client is connected, same as every other Truth
 				// bookkeeping on this hook — no disk I/O, CPU-only.
 				pendingWireEst = foldingEnabled ? truth.liveTokens() : truth.fullTokens();
+				pendingCalibrationThroughOrder = truth.blocks[truth.blocks.length - 1]?.order ?? -1;
 			}
 		} catch (err) {
 			hookErrors++;
@@ -2656,6 +2673,7 @@ export default function accordionLive(pi: ExtensionAPI, dependencies: RuntimeDep
 		// in-flight `context` hook's wire estimate — drop it rather than risk pairing the NEXT
 		// assistant reply's real usage against a now-stale pre-compaction estimate.
 		pendingWireEst = null;
+		pendingCalibrationThroughOrder = null;
 		if (!attached()) return;
 		const text = "pi compacted the session natively — Accordion's map has been rebuilt to match.";
 		try {
