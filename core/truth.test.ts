@@ -179,6 +179,42 @@ describe("Truth — birth-fold", () => {
 	});
 });
 
+// F2 (issue #11 stage 2, ADR 0025): `setCalibration` used to only bump rev + emit, unlike
+// `setBudget`/`setProtect` which both run `housekeep()` since they can move `protectedFromIndex()`.
+// `calibration` is a THIRD boundary-moving dial (`computeProtectedFromIndex` divides the real-token
+// target by `calibrationMul`), so a `k` decrease that grows the raw threshold used to leave a fold
+// standing inside the newly-enlarged protected tail until some unrelated mutation happened to run
+// `housekeep()` next. These assert `setCalibration` now heals in the SAME rev it moves the boundary,
+// mirroring the existing `setProtect` heal test, and that the birth-fold exemption still holds.
+describe("Truth — setCalibration housekeep (F2)", () => {
+	it("a strategy fold outside the tail heals when calibration shrinks and grows the raw threshold", () => {
+		const t = bulk(seq(5, 1000)); // 5 already-sent blocks, 1000 tokens each
+		t.setProtect(1500); // k=1: target=1500, cap=1875 → only index 4 protected
+		expect(t.protectedFromIndex()).toBe(4);
+		t.apply([{ kind: "fold", ids: ["a:b3:p0"] }], "auto"); // outside the tail — ordinary strategy fold
+		expect(t.isFolded(t.get("a:b3:p0")!)).toBe(true);
+		t.setCalibration(0.5); // raw threshold doubles (target/k = 1500/0.5 = 3000) → tail grows to cover index 3
+		expect(t.protectedFromIndex()).toBeLessThanOrEqual(3);
+		expect(t.isFolded(t.get("a:b3:p0")!)).toBe(false); // healed in the SAME setCalibration call
+		expect(t.get("a:b3:p0")!.override).toBe(null);
+	});
+	it("a birth-folded block does NOT heal when calibration shrinks and grows the tail over it", () => {
+		const t = live();
+		t.append(seq(6, 1000)); // live → all unsent
+		t.setProtect(1500); // k=1 → protectedFromIndex covers only the newest block
+		const newest = t.blocks[t.blocks.length - 1];
+		expect(t.isProtected(newest)).toBe(true);
+		expect(t.sent(newest)).toBe(false);
+		const r = t.apply([{ kind: "fold", ids: [newest.id] }], "auto"); // birth-fold (protected + unsent)
+		expect(r.results[0].applied).toBe(true);
+		expect(t.isFolded(t.get(newest.id)!)).toBe(true);
+		t.setCalibration(0.001); // raw threshold explodes → tail grows to cover the whole log
+		expect(t.protectedFromIndex()).toBe(0);
+		expect(t.isFolded(t.get(newest.id)!)).toBe(true); // still folded — birth-fold exemption survives
+		expect(t.birthFoldedIds).toContain(newest.id);
+	});
+});
+
 describe("Truth — groups", () => {
 	it("group op collapses a run; ungroup restores; the created group id is reported", () => {
 		const t = bulk([blk("a:b0:p0", "text", 0), blk("a:b1:p0", "text", 1), blk("a:b2:p0", "text", 2), blk("a:b3:p0", "text", 3), blk("a:b4:p0", "text", 4)]);
@@ -1039,24 +1075,75 @@ describe("Truth — calibration (issue #11 stage 1)", () => {
 		expect(events.length).toBe(0);
 	});
 
-	it("calTokens never affects canFold / protectedFromIndex / stats() — decision math is untouched by the dial", () => {
+	// Stage 1's version of this test asserted calibration NEVER reached canFold/protectedFromIndex/
+	// stats() — the whole point of stage 2 (issue #11, ADR 0025) is to flip exactly that. This
+	// rewritten test checks what genuinely stays invariant (the protect(0) shortcut, and the literal
+	// dial fields of `stats()`) alongside what now legitimately moves (`stats().liveTokens`/
+	// `fullTokens`). See the two dedicated tests below for `protectedFromIndex` itself moving under a
+	// non-zero protect target.
+	it("with protectTokens=0 the tail-boundary shortcut stays calibration-invariant, but stats() liveTokens/fullTokens are now calibrated (stage 2)", () => {
 		const t = bulk(seq(4, 1000));
-		t.setProtect(0);
-		// `rev` legitimately bumps (setCalibration is a state change like any other config dial) — every
-		// OTHER field of `stats()` must stay byte-identical, since none of them may read the dial.
-		const { rev: revBefore, ...statsBefore } = t.stats();
+		t.setProtect(0); // target===0 short-circuits computeProtectedFromIndex before it ever reads calibration
 		const pfiBefore = t.protectedFromIndex();
 		const canFoldBefore = t.canFold(t.get("a:b0:p0")!);
+		const statsBefore = t.stats();
 
 		t.setCalibration(3.7);
 
-		const { rev: revAfter, ...statsAfter } = t.stats();
-		expect(statsAfter).toEqual(statsBefore);
-		expect(revAfter).toBe(revBefore + 1);
+		// The protect(0) shortcut is untouched by the dial — same boundary, same fold verdict.
 		expect(t.protectedFromIndex()).toBe(pfiBefore);
 		expect(t.canFold(t.get("a:b0:p0")!)).toBe(canFoldBefore);
-		// The dial only affects the opt-in display helper.
-		expect(t.calTokens(1000)).toBe(3700);
+
+		const statsAfter = t.stats();
+		// budget / protectTokens / contextWindow / protectedFromIndex / blockCount are literal dial
+		// values / structural facts — untouched by the multiplier (see `TruthStats`'s doc comment).
+		expect(statsAfter.budget).toBe(statsBefore.budget);
+		expect(statsAfter.protectTokens).toBe(statsBefore.protectTokens);
+		expect(statsAfter.contextWindow).toBe(statsBefore.contextWindow);
+		expect(statsAfter.protectedFromIndex).toBe(statsBefore.protectedFromIndex);
+		expect(statsAfter.blockCount).toBe(statsBefore.blockCount);
+		// liveTokens/fullTokens ARE calibrated (stage 2) — the whole point of issue #11.
+		expect(statsAfter.liveTokens).toBe(t.calTokens(statsBefore.liveTokens));
+		expect(statsAfter.fullTokens).toBe(t.calTokens(statsBefore.fullTokens));
+		expect(statsAfter.fullTokens).toBe(Math.round(statsBefore.fullTokens * 3.7));
+	});
+
+	it("protectedFromIndex moves under a non-1 calibration (stage 2): the SAME real protectTokens target maps to a SMALLER raw-estimate region as k grows", () => {
+		const t = bulk(seq(5, 1000)); // 5 blocks, 1000 raw tokens each
+		t.setProtect(2500); // a REAL 2500-token target
+
+		// k=1: raw-equivalent target is still 2500, cap 3125 — walking from the newest block backward,
+		// 3 blocks (3000 raw) crosses the target before the cap does — tail = indices [2,3,4].
+		expect(t.protectedFromIndex()).toBe(2);
+
+		t.setCalibration(2);
+		// raw-equivalent target is now 2500/2 = 1250 (cap 1562.5): 2 blocks (2000 raw) already exceed
+		// the CAP before reaching a 3rd, so the walk stops early — tail shrinks to just [4]. This is
+		// the intended effect: once real tokens run higher than the raw estimate, FEWER raw-estimated
+		// blocks are needed to satisfy the same real-token protection target.
+		expect(t.protectedFromIndex()).toBe(4);
+	});
+
+	it("protectedFromIndex boundary is IDENTICAL between the host and a JSON-round-tripped replica under a non-1 calibration (stage 2 determinism)", () => {
+		const host = live();
+		host.append(seq(6, 1000));
+		host.setProtect(2500);
+		host.setCalibration(1.375);
+		const hostPfi = host.protectedFromIndex();
+
+		// Sanity: calibration genuinely moved the boundary versus k=1, so this test isn't vacuous.
+		const atDefault = live();
+		atDefault.append(seq(6, 1000));
+		atDefault.setProtect(2500);
+		expect(hostPfi).not.toBe(atDefault.protectedFromIndex());
+
+		// Round-trip through JSON (not just object assignment) — any finite double survives
+		// `JSON.stringify`/`JSON.parse` exactly (the shortest-round-tripping-decimal guarantee), which
+		// is the same path `calibration` takes over the real WS wire.
+		const wireState = JSON.parse(JSON.stringify(serializeSnapshot(host, false)));
+		const replica = hydrateSnapshot(META, wireState);
+		expect(replica.calibration).toBe(host.calibration);
+		expect(replica.protectedFromIndex()).toBe(hostPfi);
 	});
 
 	it("survives rebuildFrom (carried like budget/protectTokens), and a fresh build (prev === null) stays at the default", () => {
@@ -1112,6 +1199,153 @@ describe("Truth — calibration (issue #11 stage 1)", () => {
 		replica.append(seq(2, 1000));
 		applyWireEvent(replica, cfgEv!);
 		expect(replica.calibration).toBe(1.1);
+		expect(replica.budget).toBe(budget0);
+		expect(replica.protectTokens).toBe(protect0);
+	});
+});
+
+// Issue #93: the system prompt as a scalar Truth fact — never a Block (no id, so no fold/pin/group
+// affordance can ever target it), captured/pushed via the same config-dial shape as `calibration`/
+// `contextWindow`, and folded into `liveTokens()`/`fullTokens()` (un-smearing it out of ADR 0025's
+// calibration pairing — see that ADR's issue-#93 addendum).
+describe("Truth — systemPrompt (issue #93)", () => {
+	it("defaults to null", () => {
+		const t = bulk(seq(2, 1000));
+		expect(t.systemPrompt).toBe(null);
+	});
+
+	it("setSystemPrompt sets it, bumps rev, and emits a config event", () => {
+		const t = bulk(seq(2, 1000));
+		const events: any[] = [];
+		t.onEvent((e) => events.push(e));
+		const rev0 = t.rev;
+
+		t.setSystemPrompt("You are a helpful assistant.", 8);
+		expect(t.systemPrompt).toEqual({ text: "You are a helpful assistant.", tokens: 8 });
+		expect(t.rev).toBe(rev0 + 1);
+		expect(events.at(-1)).toMatchObject({ type: "config", systemPrompt: { text: "You are a helpful assistant.", tokens: 8 } });
+
+		// A second call overwrites outright — no merge, no history.
+		t.setSystemPrompt("New prompt.", 3);
+		expect(t.systemPrompt).toEqual({ text: "New prompt.", tokens: 3 });
+		expect(t.rev).toBe(rev0 + 2);
+	});
+
+	it("refuses non-string text / non-finite / negative tokens — no poison, no rev bump, no event", () => {
+		const t = bulk(seq(2, 1000));
+		const rev0 = t.rev;
+		const events: any[] = [];
+		t.onEvent((e) => events.push(e));
+
+		t.setSystemPrompt(123 as unknown as string, 5);
+		t.setSystemPrompt("ok", NaN);
+		t.setSystemPrompt("ok", Infinity);
+		t.setSystemPrompt("ok", -1);
+		expect(t.systemPrompt).toBe(null); // unchanged, not poisoned
+		expect(t.rev).toBe(rev0);
+		expect(events.length).toBe(0);
+
+		t.setSystemPrompt("a real one", 4); // a real value still applies
+		expect(t.systemPrompt).toEqual({ text: "a real one", tokens: 4 });
+	});
+
+	it("liveTokens()/fullTokens() include the raw system-prompt estimate (un-smearing); blockCount is unaffected", () => {
+		const t = bulk(seq(4, 1000));
+		t.setProtect(0);
+		const before = t.stats();
+		expect(before.fullTokens).toBe(4000);
+		expect(before.liveTokens).toBe(4000);
+
+		t.setSystemPrompt("x".repeat(2000), 500);
+		const after = t.stats();
+		expect(after.fullTokens).toBe(4500);
+		expect(after.liveTokens).toBe(4500);
+		expect(after.blockCount).toBe(4); // block-only — untouched
+	});
+
+	it("is a no-op contribution when uncaptured (every CC/demo/file session)", () => {
+		const t = bulk(seq(3, 1000));
+		expect(t.systemPrompt).toBe(null);
+		expect(t.stats().liveTokens).toBe(3000);
+		expect(t.stats().fullTokens).toBe(3000);
+	});
+
+	it("computeProtectedFromIndex is unaffected — it walks raw block tokens directly, never through liveTokens()/fullTokens()", () => {
+		const withSp = bulk(seq(5, 1000));
+		withSp.setProtect(2500);
+		const pfiBefore = withSp.protectedFromIndex();
+		withSp.setSystemPrompt("x".repeat(40_000), 10_000); // a huge system prompt
+		expect(withSp.protectedFromIndex()).toBe(pfiBefore); // the tail boundary did not move
+	});
+
+	it("survives rebuildFrom (carried like calibration/budget), and a fresh build (prev === null) stays null", () => {
+		const host = live();
+		host.append(seq(3, 1000));
+		host.setSystemPrompt("captured prompt", 4);
+
+		const fresh = seq(3, 1000);
+		const next = Truth.rebuildFrom(host, { meta: META, blocks: fresh, lineCount: 0, skipped: 0 });
+		expect(next.systemPrompt).toEqual({ text: "captured prompt", tokens: 4 });
+
+		const firstBuild = Truth.rebuildFrom(null, { meta: META, blocks: fresh, lineCount: 0, skipped: 0 });
+		expect(firstBuild.systemPrompt).toBe(null); // not polluted by ANY prior state
+	});
+
+	it("round-trips through serializeSnapshot → hydrateSnapshot (replica replay parity)", () => {
+		const host = live();
+		host.append(seq(2, 1000));
+		host.setSystemPrompt("a prompt", 3);
+
+		const state = serializeSnapshot(host, false);
+		expect(state.systemPrompt).toEqual({ text: "a prompt", tokens: 3 });
+
+		const replica = hydrateSnapshot(META, state);
+		expect(replica.systemPrompt).toEqual({ text: "a prompt", tokens: 3 });
+		expect(replica.rev).toBe(host.rev);
+
+		// A stale-format peer that omits `systemPrompt` (pre-v19) falls back to null rather than
+		// forking on `undefined` — never a decision-affecting divergence.
+		const stale = hydrateSnapshot(META, { ...state, systemPrompt: undefined });
+		expect(stale.systemPrompt).toBe(null);
+	});
+
+	it("adoptSnapshot self-validates a malformed shape (bad text/tokens type) to null, same guard shape as calibration", () => {
+		const host = live();
+		host.append(seq(2, 1000));
+		const state = serializeSnapshot(host, false);
+
+		const badTokens = hydrateSnapshot(META, { ...state, systemPrompt: { text: "ok", tokens: NaN } });
+		expect(badTokens.systemPrompt).toBe(null);
+
+		const badText = hydrateSnapshot(META, { ...state, systemPrompt: { text: 5 as unknown as string, tokens: 3 } });
+		expect(badText.systemPrompt).toBe(null);
+
+		const negativeTokens = hydrateSnapshot(META, { ...state, systemPrompt: { text: "ok", tokens: -1 } });
+		expect(negativeTokens.systemPrompt).toBe(null);
+	});
+
+	it("a config event carrying ONLY systemPrompt replays via applyWireEvent without touching the other dials", () => {
+		const host = live();
+		host.append(seq(2, 1000));
+		const budget0 = host.budget;
+		const protect0 = host.protectTokens;
+
+		const events: WireEvent[] = [];
+		const off = host.onEvent((e) => {
+			const w = wireEventFromTruthEvent(e);
+			if (w) events.push(w);
+		});
+		host.setSystemPrompt("a prompt", 3);
+		off();
+		const cfgEv = events.find((e) => e.kind === "config");
+		expect(cfgEv).toMatchObject({ kind: "config", systemPrompt: { text: "a prompt", tokens: 3 } });
+		expect((cfgEv as any).budget).toBeUndefined();
+		expect((cfgEv as any).protectTokens).toBeUndefined();
+
+		const replica = live();
+		replica.append(seq(2, 1000));
+		applyWireEvent(replica, cfgEv!);
+		expect(replica.systemPrompt).toEqual({ text: "a prompt", tokens: 3 });
 		expect(replica.budget).toBe(budget0);
 		expect(replica.protectTokens).toBe(protect0);
 	});

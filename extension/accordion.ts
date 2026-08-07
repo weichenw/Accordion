@@ -55,6 +55,7 @@ import type { ExtensionAPI, ExtensionContext, ExtensionCommandContext } from "@e
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
 
 import { Truth } from "../core/truth";
+import { estTokens } from "../core/tokens";
 import { linearize, messageInfo, contentFingerprint, wireToBlock, type PiMessage } from "../core/wire";
 import { serializeSnapshot, wireEventFromTruthEvent } from "../core/replica";
 import { resolveUnfold, resolveRecall } from "../core/agentView";
@@ -505,6 +506,12 @@ export default function accordionLive(pi: ExtensionAPI, dependencies: RuntimeDep
 	let model = "";
 	let tokens: number | null = null;
 	let contextWindow: number | null = null;
+	// Issue #93: module-level cache of the most recently captured system prompt, same shape as
+	// `contextWindow` above and for the same reason — `refreshFromCtx` runs before `truth` may be
+	// null/about to be rebuilt (`ingestMessages` → `buildTruth`), so the captured value must survive
+	// that gap and get re-applied once a fresh `Truth` exists (see `buildTruth`'s re-apply).
+	let systemPromptText: string | null = null;
+	let systemPromptTokens = 0;
 	let heartbeat: ReturnType<typeof setInterval> | null = null;
 	// Set iff the HTTP server's bind failed (e.g. an unexpected EADDRINUSE on the ephemeral port).
 	// Previously the "error" listener discarded the error entirely, so `port` stayed 0
@@ -962,6 +969,21 @@ export default function accordionLive(pi: ExtensionAPI, dependencies: RuntimeDep
 			if (truth && contextWindow != null && truth.contextWindow !== contextWindow) {
 				truth.setContextWindow(contextWindow);
 				clampBudgetToWindow(truth, contextWindow);
+			}
+			// Issue #93: capture the CURRENT effective system prompt on every hook tick (never at
+			// `session_start` — that races pi's own `resources_discover`-driven rebuild, see
+			// `ExtensionContext.getSystemPrompt`'s call site history). `getSystemPrompt` is a cheap field
+			// read, not a rebuild, and reflects any per-turn `before_agent_start` override already
+			// applied — the effective prompt is NOT guaranteed static across a session (pi can rebuild it
+			// on a model/tool-set change), so this diffs on every tick rather than capturing once.
+			// Optionally-typed cast: guards a version-skewed pi host that predates this API.
+			const sp = (ctx as { getSystemPrompt?: () => string }).getSystemPrompt?.();
+			if (typeof sp === "string") {
+				systemPromptText = sp;
+				systemPromptTokens = estTokens(sp);
+			}
+			if (truth && systemPromptText !== null && truth.systemPrompt?.text !== systemPromptText) {
+				truth.setSystemPrompt(systemPromptText, systemPromptTokens);
 			}
 		} catch {
 			/* optional APIs */
@@ -2087,6 +2109,12 @@ export default function accordionLive(pi: ExtensionAPI, dependencies: RuntimeDep
 			if (!prev) t.setBudget(contextWindow);
 			else clampBudgetToWindow(t, contextWindow);
 		}
+		// Issue #93: re-apply the captured system prompt, same shape as `contextWindow` above. Covers
+		// the very-first-hook case (`refreshFromCtx` ran while `truth` was still null, so its own
+		// apply-if-changed branch was skipped) and is a harmless no-op confirmation on a later rebuild
+		// (`Truth.rebuildFrom` already carried `prev`'s identical value). Placed BEFORE `onEvent`
+		// subscribes below, so this call's own `config` event — if any — never double-broadcasts.
+		if (systemPromptText !== null) t.setSystemPrompt(systemPromptText, systemPromptTokens);
 		// One subscription drives BOTH the client fan-out (replayable events) and the in-process
 		// conductor's HostEvent stream — the same TruthEvent, projected two ways.
 		unsubTruth = t.onEvent((e) => {
@@ -2183,13 +2211,19 @@ export default function accordionLive(pi: ExtensionAPI, dependencies: RuntimeDep
 	 * Real provider usage fields (issue #11 stage 1) — NOT part of `core/wire.ts`'s `PiMessage` (a
 	 * lowest-common-denominator projection used across both the extension and `core/`), so read them
 	 * off the raw pi message object instead of the narrowed type.
+	 *
+	 * Deliberately no `totalTokens` field (F6, review round): the pairing this project chose is
+	 * `input + cacheRead + cacheWrite`, never `usage.totalTokens` (see `maybeObserveCalibration`'s
+	 * doc for why `output` is excluded). Accepted gap: a provider that reports ONLY `totalTokens` and
+	 * leaves `input`/`cacheRead`/`cacheWrite` all undefined never calibrates — `real` computes to 0
+	 * and the `real <= 0` guard below refuses the observation — rather than silently falling back to
+	 * a quantity (`totalTokens`, which INCLUDES output) this pairing exists specifically to exclude.
 	 */
 	interface RealUsage {
 		input?: number;
 		output?: number;
 		cacheRead?: number;
 		cacheWrite?: number;
-		totalTokens?: number;
 	}
 
 	/**
@@ -2212,11 +2246,14 @@ export default function accordionLive(pi: ExtensionAPI, dependencies: RuntimeDep
 	 * compaction gap) and isolates exactly the one request `pendingWireEst` describes, rather than
 	 * blending in `ctx.getContextUsage()`'s own trailing-message estimate.
 	 *
-	 * SMEARING CAVEAT: `est` is Truth's own block-token accounting, which — by design — excludes the
-	 * system prompt and tool-call schemas (neither belongs to any block). `real` includes them. One
-	 * multiplier therefore distributes that fixed overhead PROPORTIONALLY across every block rather
-	 * than carrying it as its own line item — `real = base + k·est` would be the honest affine model;
-	 * we ship the pure multiplier knowingly (stage 1 scope; see ADR 0025 for the stage-2 plan).
+	 * SMEARING CAVEAT: `est` is Truth's own block-token accounting, which — by design — excludes
+	 * tool-call schemas (they belong to no block). `real` includes them. One multiplier therefore
+	 * distributes that fixed overhead PROPORTIONALLY across every block rather than carrying it as its
+	 * own line item — `real = base + k·est` would be the honest affine model; we ship the pure
+	 * multiplier knowingly (stage 1 scope; see ADR 0025 for the stage-2 plan). UPDATED (issue #93):
+	 * `est` (`truth.liveTokens()`/`fullTokens()`) now ALSO includes the system prompt's own raw
+	 * estimate, so as of the un-smearing fix, the system prompt is no longer part of this caveat —
+	 * only tool-call-schema overhead remains smeared into `k`. See ADR 0025's issue-#93 addendum.
 	 */
 	function maybeObserveCalibration(msg: unknown): void {
 		if (!truth) return;
@@ -2241,13 +2278,25 @@ export default function accordionLive(pi: ExtensionAPI, dependencies: RuntimeDep
 	 * Append ONE just-finished message (message_end) to the Truth immediately — this is what kills
 	 * the one-turn lag. Deduped on the message's durable ids so a re-fire or an already-appended
 	 * message is skipped (and `lastMessages` is extended so the next context prefix still matches).
+	 *
+	 * `allowCalibration` (issue #11 F3, ADR 0025) defaults true for the normal `message_end` path,
+	 * where it is always correct: `message_end` fires once per message, immediately after that
+	 * message's own generating `context` hook and strictly before the NEXT one, so `pendingWireEst`
+	 * always describes the wire that produced THIS message. The `agent_end` backstop below passes
+	 * `false` for every message except the run's FINAL assistant reply — see that handler's comment
+	 * for why an EARLIER newly-appended message must never be allowed to consume `pendingWireEst`.
 	 */
-	function ingestFinishedMessage(msg: PiMessage): void {
+	function ingestFinishedMessage(msg: PiMessage, allowCalibration = true): void {
 		if (!truth) return;
-		maybeObserveCalibration(msg);
 		const ids = messageInfo(msg, 0).ids;
 		if (!ids.length) return;
 		if (ids.every((id) => truth!.get(id))) return; // already represented → nothing to do
+		// Calibration pairing runs only for a message actually being NEWLY appended (review round,
+		// issue #11): the `agent_end` backstop replays the whole run in order, and an already-appended
+		// earlier assistant message must be deduped out ABOVE before it can consume `pendingWireEst` —
+		// otherwise it would mispair its own (older, smaller) usage against the estimate of the LATER
+		// departing wire the backstop is actually recovering, snapping k visibly low for one turn.
+		if (allowCalibration) maybeObserveCalibration(msg);
 		appendSuffix([...lastMessages, msg], lastMessages.length);
 		setLastMessages([...lastMessages, msg], [...lastFps, contentFingerprint(msg)]);
 	}
@@ -2515,10 +2564,33 @@ export default function accordionLive(pi: ExtensionAPI, dependencies: RuntimeDep
 	// prior context until the next `context` hook restores the full history. Replay these run-local
 	// messages through the same idempotent delta path as `message_end` instead. Usually every id is
 	// already present; this remains a backstop for any finalized message that hook missed.
+	//
+	// CALIBRATION PAIRING (issue #11 F3, ADR 0025): a multi-call run (a tool loop) fires the
+	// `context` hook once per LLM call, each overwriting `pendingWireEst` with the estimate of ITS
+	// OWN departing wire — by the time this backstop runs, `pendingWireEst` (if still set at all)
+	// describes only the LAST of those calls. If `message_end` missed an EARLIER assistant message
+	// in this run (the actual gap this backstop exists to cover), that message reaches
+	// `ingestFinishedMessage` here as genuinely new, and — pre-fix — would consume whatever
+	// `pendingWireEst` happened to be sitting there and pair its own (earlier, smaller) usage against
+	// the estimate of a wire it never departed on, corrupting `calibration` for that observation and
+	// starving the run's actual FINAL reply (the very next `ingestFinishedMessage` call) of the
+	// pairing it should have gotten. Only the run's FINAL assistant message may pair: it is the one
+	// message in this array `message_end` had a chance to pair correctly too, so replaying it here is
+	// exactly like `message_end`'s own normal case (usually a no-op — this id is already in Truth —
+	// and otherwise correct). Every earlier message replays with calibration suppressed, never
+	// touching `pendingWireEst`, which stays reserved for the final message's own pairing attempt.
 	pi.on("agent_end", (event, ctx: ExtensionContext) => {
 		latestCtx = ctx;
 		sendStream({ type: "stream", phase: "abort", kind: "text", contentIndex: -1 });
-		for (const msg of event.messages as unknown as PiMessage[]) ingestFinishedMessage(msg);
+		const messages = event.messages as unknown as PiMessage[];
+		let lastAssistantIdx = -1;
+		for (let i = messages.length - 1; i >= 0; i--) {
+			if (messages[i]?.role === "assistant") {
+				lastAssistantIdx = i;
+				break;
+			}
+		}
+		messages.forEach((msg, i) => ingestFinishedMessage(msg, i === lastAssistantIdx));
 	});
 
 	// ── suppress pi's native compaction ONLY while folding is actually armed ────
