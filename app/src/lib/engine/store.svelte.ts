@@ -17,6 +17,9 @@ import { hasLock } from "./locks";
 import { Truth } from "$core/truth";
 import type { Op, OpResult } from "$core/ops";
 import type { TruthEvent } from "$core/events";
+import { applyWireEvent } from "$core/replica";
+import { resolveUnfold as coreResolveUnfold, resolveRecall as coreResolveRecall } from "$core/agentView";
+import type { WireEvent, WireCommand, FoldOp, GroupOp } from "$core/protocol";
 
 interface LogEntry {
 	by: Actor;
@@ -61,6 +64,7 @@ export class AccordionStore {
 		return this._groups;
 	}
 	set groups(v: Group[]) {
+		this.assertLocalMode("groups");
 		this.truth.setGroups(v);
 		this._groups = this.truth.groups.map(cloneGroup);
 		this.version++;
@@ -79,9 +83,23 @@ export class AccordionStore {
 	private logN = 0;
 	private mirrorIndex = new Map<string, number>();
 
-	constructor(parsed: ParsedSession) {
-		this.meta = parsed.meta;
-		this.truth = new Truth(parsed);
+	/**
+	 * Phase B command sink. When set (live mode), the store is a REPLICA + remote control: human
+	 * steering actions are forwarded to the wire as `WireCommand`s instead of applied to the local
+	 * Truth. The authoritative extension applies them and the resulting events echo back through
+	 * `replayEvent` — no optimistic apply, so the mirror only ever moves via the event stream.
+	 * Null (local mode: CC / file / demo) ⇒ actions apply directly to the local Truth as before.
+	 */
+	private commandSink: ((cmd: WireCommand) => void) | null = null;
+
+	/**
+	 * @param parsed        the parsed session (local mode). For a live replica, pass `existingTruth`.
+	 * @param existingTruth a pre-built (Phase B: replica-hydrated, rev-aligned) Truth to wrap; the
+	 *                      mirror seeds from IT, and `parsed` is ignored except as a type placeholder.
+	 */
+	constructor(parsed: ParsedSession, existingTruth?: Truth) {
+		this.truth = existingTruth ?? new Truth(parsed);
+		this.meta = this.truth.meta;
 		this.truth.onEvent((e) => this.applyTruthEvent(e));
 		// Seed the mirror from the truth's initial (post-construction) state.
 		this.blocks = this.truth.blocks.map(cloneBlock);
@@ -159,6 +177,68 @@ export class AccordionStore {
 		this._groups = this.truth.groups.map(cloneGroup);
 	}
 
+	// ── Phase B: replica + remote control ───────────────────────────────────
+	/** Install (live mode) / clear (local mode) the wire command sink. */
+	setCommandSink(sink: ((cmd: WireCommand) => void) | null): void {
+		this.commandSink = sink;
+	}
+	/** True iff human actions route to the wire (live mode) rather than the local Truth. */
+	get wireControlled(): boolean {
+		return this.commandSink !== null;
+	}
+	/**
+	 * Guard for the six mutators (`setContextWindow`, `appendBlocks`, `setLocks`, `clearLocks`, the
+	 * `groups` setter, the `wireAttached` setter) that write wire FACTS straight to the local Truth
+	 * instead of routing through `commandSink` like fold/pin/setBudget/setProtect do. In live replica
+	 * mode that wire input arrives ONLY via `replayEvent` (called by `liveClient.svelte.ts`), which
+	 * mutates the underlying Truth directly through `applyWireEvent` — it never calls these methods.
+	 * So calling one of these WHILE a command sink is installed is never correct: it would locally
+	 * fork the replica away from the host instead of waiting for the echoed event. Throws
+	 * unconditionally (no local-mode/live-mode split) — there is no live-mode caller these could ever
+	 * legitimately serve.
+	 */
+	private assertLocalMode(name: string): void {
+		if (this.commandSink) {
+			throw new Error(`AccordionStore.${name}() is local-only — it must not be called in live replica mode (state arrives via replayEvent)`);
+		}
+	}
+	/** The Truth's monotonic rev — the replica gap-check anchor. */
+	get rev(): number {
+		return this.truth.rev;
+	}
+	/** Replay a serialized host event onto the (replica) Truth; the mirror updates via `onEvent`. */
+	replayEvent(ev: WireEvent): void {
+		applyWireEvent(this.truth, ev);
+	}
+	/** Route a steering op transaction to the wire when live, else apply it to the local Truth. */
+	private applyOps(ops: Op[], by: Actor): void {
+		if (this.commandSink && by === "you") {
+			this.commandSink({ kind: "ops", ops });
+			return;
+		}
+		this.truth.apply(ops, by);
+	}
+	/** The wire fold ops for the current state (view-over-truth; used by the fold-alarm diagnostic + tests). */
+	computeFoldOps(): FoldOp[] {
+		return this.truth.computeFoldOps();
+	}
+	/** The wire group-collapse ops for the current state (view-over-truth). */
+	computeGroupOps(): GroupOp[] {
+		return this.truth.computeGroupOps();
+	}
+	/**
+	 * Agent unfold/recall resolution against the underlying Truth. In production this runs
+	 * extension-side (core/agentView over the authoritative Truth); these thin passthroughs expose
+	 * it for read-only/CC contexts and the live-layer tests. NOTE: `resolveUnfold` MUTATES the
+	 * Truth locally — never call it on a live REPLICA (steering must route through the command sink).
+	 */
+	resolveUnfold(codes: string[]) {
+		return coreResolveUnfold(this.truth, codes);
+	}
+	resolveRecall(codes: string[]) {
+		return coreResolveRecall(this.truth, codes);
+	}
+
 	// ── activity log (built from truth events) ──────────────────────────────
 	private emit(by: Actor, action: string, detail: string): void {
 		this.log.unshift({ by, action, detail, n: this.logN++ });
@@ -225,42 +305,64 @@ export class AccordionStore {
 		return this._activeTail;
 	}
 
-	// ── the wire-attached flag (set by the live client) ─────────────────────
+	// ── the wire-attached flag (local-mode / test seam) ─────────────────────
+	// In live mode the replica's `wireAttached` arrives baked into the snapshot/`adoptSnapshot`
+	// (hydrateSnapshot sets it on the Truth directly) — this setter is for local/demo sessions that
+	// want to simulate a live wire (e.g. group-accounting cross-validation tests), so it is guarded
+	// the same as the other five wire-fact mutators below.
 	get wireAttached(): boolean {
 		return this.truth.wireAttached;
 	}
 	set wireAttached(v: boolean) {
+		this.assertLocalMode("wireAttached");
 		if (this.truth.wireAttached === v) return;
 		this.truth.wireAttached = v; // bumps the truth rev → group accounting recomputes
 		this.version++;
 	}
 
 	// ── config dials ────────────────────────────────────────────────────────
+	// Budget + protect are human dials → route to the wire in live mode. contextWindow, append,
+	// and locks are wire FACTS — in live mode they arrive over the wire as `event`s and are applied
+	// by `replayEvent` (→ `applyWireEvent`) DIRECTLY against the Truth, bypassing these methods
+	// entirely. So these methods are local-mode-only (demo / CC / file / tests); `assertLocalMode`
+	// refuses a live-mode call rather than let it silently fork the replica from the host.
 	setBudget(n: number): void {
+		if (this.commandSink) {
+			this.commandSink({ kind: "setBudget", value: n });
+			return;
+		}
 		this.truth.setBudget(n);
 	}
 	setContextWindow(n: number): void {
+		this.assertLocalMode("setContextWindow");
 		this.truth.setContextWindow(n);
 	}
 	setProtect(n: number): void {
+		if (this.commandSink) {
+			this.commandSink({ kind: "setProtect", value: n });
+			return;
+		}
 		this.truth.setProtect(n);
 	}
 	appendBlocks(blocks: Block[]): void {
+		this.assertLocalMode("appendBlocks");
 		this.truth.append(blocks);
 	}
 	setLocks(locks: readonly LockName[], holder: string, tailTokens = 0): void {
+		this.assertLocalMode("setLocks");
 		this.truth.setLocks(locks, holder, tailTokens);
 	}
 	clearLocks(): void {
+		this.assertLocalMode("clearLocks");
 		this.truth.clearLocks();
 	}
 
-	// ── manual actions (forward to the single write path) ───────────────────
+	// ── manual actions (route to the wire in live mode, else the single write path) ──
 	fold(id: string, by: Actor = "you"): void {
-		this.truth.apply([{ kind: "fold", ids: [id] }], by);
+		this.applyOps([{ kind: "fold", ids: [id] }], by);
 	}
 	unfold(id: string, by: Actor = "you"): void {
-		this.truth.apply([{ kind: "unfold", ids: [id] }], by);
+		this.applyOps([{ kind: "unfold", ids: [id] }], by);
 	}
 	toggle(id: string, by: Actor = "you"): void {
 		const b = this.get(id);
@@ -268,16 +370,16 @@ export class AccordionStore {
 		this.isFolded(b) ? this.unfold(id, by) : this.fold(id, by);
 	}
 	pin(id: string): void {
-		this.truth.apply([{ kind: "pin", ids: [id] }], "you");
+		this.applyOps([{ kind: "pin", ids: [id] }], "you");
 	}
 	unpin(id: string): void {
-		this.truth.apply([{ kind: "unpin", ids: [id] }], "you");
+		this.applyOps([{ kind: "unpin", ids: [id] }], "you");
 	}
 	auto(id: string): void {
-		this.truth.apply([{ kind: "auto", ids: [id] }], "you");
+		this.applyOps([{ kind: "auto", ids: [id] }], "you");
 	}
 	resetAll(): void {
-		this.truth.apply([{ kind: "resetAll" }], "you");
+		this.applyOps([{ kind: "resetAll" }], "you");
 	}
 
 	// ── group actions ───────────────────────────────────────────────────────
@@ -327,19 +429,25 @@ export class AccordionStore {
 	}
 
 	createGroup(startId: string, endId: string, by: Actor = "you", digest?: string | null): Group | null {
+		// Live mode: the group materializes when the host's ops-applied event echoes back, so there
+		// is no synchronous group to return — return null (callers must not depend on the handle live).
+		if (this.commandSink && by === "you") {
+			this.commandSink({ kind: "ops", ops: [{ kind: "group", ids: [startId, endId], summary: digest }] });
+			return null;
+		}
 		const r = this.truth.apply([{ kind: "group", ids: [startId, endId], summary: digest }], by);
 		const res = r.results[0];
 		if (!res || !res.applied || !res.detail) return null;
 		return this.groupById(res.detail) ?? null;
 	}
 	deleteGroup(id: string, by: Actor = "you"): void {
-		this.truth.apply([{ kind: "ungroup", groupId: id }], by);
+		this.applyOps([{ kind: "ungroup", groupId: id }], by);
 	}
 	foldGroup(id: string, by: Actor = "you"): void {
-		this.truth.apply([{ kind: "foldGroup", groupId: id }], by);
+		this.applyOps([{ kind: "foldGroup", groupId: id }], by);
 	}
 	unfoldGroup(id: string, by: Actor = "you"): void {
-		this.truth.apply([{ kind: "unfoldGroup", groupId: id }], by);
+		this.applyOps([{ kind: "unfoldGroup", groupId: id }], by);
 	}
 	toggleGroup(id: string, by: Actor = "you"): void {
 		const g = this.groupById(id);

@@ -224,6 +224,9 @@ export class ThermoclineConductor implements Conductor {
 				this.agentTouched.add(c.id);
 				this.recalledThisEpoch.add(c.id);
 				sawAgentTouch = true;
+				// An agent UNFOLD (not a read-only recall) forced the block standing-open — it is no
+				// longer our fold, so drop it from the applied set to keep fill/projection honest.
+				if (c.what === "unfold") this.appliedFolds.delete(c.id);
 			}
 			// humanOverride ids are NOT added here: the view's per-block `held` flag already reflects
 			// them next tick and policy's graduation resets on `held`. Adding them would permanently
@@ -269,7 +272,13 @@ export class ThermoclineConductor implements Conductor {
 			blocks: this.host.blocks().slice() as ViewBlock[],
 			budget: stats.budget,
 			contextWindow: stats.contextWindow,
-			liveTokens: stats.liveTokens,
+			// RAW baseline, NOT stats.liveTokens. The policy's `project()` re-derives OUR savings from a
+			// baseline where none of our folds/strata are applied. In the new engine our folds PERSIST,
+			// so stats.liveTokens ALREADY reflects them — feeding that in would double-count our own
+			// folding (fill/projection would read far too low). Because we hold `human-steering`, the
+			// ONLY foldable overlay is ours, so the raw "none-of-mine-folded" baseline is exactly
+			// stats.fullTokens; `project(view, appliedForProject())` then reproduces stats.liveTokens.
+			liveTokens: stats.fullTokens,
 			protectedFromIndex: stats.protectedFromIndex,
 			protectTokens: stats.protectTokens,
 		};
@@ -301,8 +310,7 @@ export class ThermoclineConductor implements Conductor {
 		this.validateRestoredStrata(view);
 
 		const cap = capOf(view);
-		const fill = cap > 0 ? project(view, this.appliedForProject()) / cap : 0;
-		this.lastFill = fill;
+		let fill = cap > 0 ? project(view, this.appliedForProject()) / cap : 0;
 
 		// everWarm tracks the latest scores on EVERY tick (before any graduation computation), so a
 		// unit that became hot this tick already needs 2K before the graduation decision reads it.
@@ -317,7 +325,13 @@ export class ThermoclineConductor implements Conductor {
 		// EMERGENCY: already over budget — deterministic, immediate, no LLM.
 		if (fill > 1.0) {
 			this.runEmergency(view);
+			// Re-measure AFTER the emergency compressed. (Refinement over the .mjs port, which used the
+			// stale pre-emergency fill and thus kicked a redundant LLM epoch after every emergency — the
+			// "two cache misses in quick succession" the ADR flagged.) A PREPARE fires below only if the
+			// deterministic emergency could NOT bring us under warmWater (e.g. an oversized protected tail).
+			fill = cap > 0 ? project(view, this.appliedForProject()) / cap : fill;
 		}
+		this.lastFill = fill;
 
 		// ANTICIPATE: approaching warmWater and no prepare in flight → start one.
 		if (fill >= this.cfg.warmWater && !this.preparing && this.needNewEpoch(fill)) {
