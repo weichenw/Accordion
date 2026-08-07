@@ -35,12 +35,23 @@ export function decideAutoClaim(info: ControllerInfo | null, mySurfaceId: string
 	return "popup";
 }
 
+/**
+ * True iff a DIFFERENT surface currently holds a FRESH lease — i.e. someone else is actively steering
+ * *right now*. This, not `!isController`, is what gates the READ-ONLY chrome (U1): a null OR stale lease
+ * is NOT "someone else steers" — it is uncontested, so this surface silently auto-claims it
+ * (`decideAutoClaim` → "claim") and must paint ZERO read-only chrome in the meantime. `!isController`
+ * would (wrongly) render read-only on every fresh, uncontested connect until the silent auto-claim
+ * round-tripped — the false READ-ONLY flash this predicate removes. Pure/framework-free for testing.
+ */
+export function someoneElseControls(info: ControllerInfo | null, mySurfaceId: string): boolean {
+	return !!info && info.fresh && info.surfaceId !== mySurfaceId;
+}
+
 // ── the one-time takeover popup ──────────────────────────────────────────────
 const POPUP_SEEN_KEY = "accordion_takeover_popup_seen";
 
 // Read through `window.sessionStorage` (not the bare global) — the same seam `mySurfaceId()`
-// uses for `localStorage` in liveClient.svelte.ts, so tests shim `globalThis.window` once and
-// both modules pick it up identically.
+// uses (surfaceId.ts), so tests shim `globalThis.window` once and both modules pick it up identically.
 function sessionFlagSet(key: string): boolean {
 	try {
 		return typeof window !== "undefined" && window.sessionStorage?.getItem(key) === "1";
