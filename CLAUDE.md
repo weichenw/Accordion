@@ -13,8 +13,8 @@ Guidance for AI coding sessions. [VISION.md](VISION.md) = product north star · 
 - **block** — atomic unit of context: one chunk of a single kind (`user`, `text`, `thinking`, `tool_call`, or `tool_result`). See `engine/types.ts → Block`.
 - **turn** — one user message plus all assistant content (thinking, text, tool calls, tool results) that follows it before the next user message.
 - **fold / folding** — replacing a block's content in-place with something shorter, like a summary; the block stays on the wire to the LLM in compressed form. Always reversible.
-- **held** — a block carrying a human override (manual pin, fold, or unfold). `ViewBlock.held = true`; the host refuses conductor commands on held blocks unless the conductor holds a `human-steering` involvement lock.
-- **conductor** — a pluggable context-management strategy (`conduct(view) → Command[]`). Decides which blocks to fold, group, replace, pin, etc. between turns.
+- **held** — a block carrying a human override (manual pin, fold, or unfold): a non-null `Block.override` (see `engine/types.ts → Block`). *(The `human-steering` involvement lock can now gate whether a human hold can be created — see the Conductors section; the ADR-0011 lock system is back as an engine capability, though nothing holds a lock yet.)*
+- **conductor** — *(removed on this branch, pending a ground-up redesign)* a pluggable context-management strategy that decided which blocks to fold/group between turns. The strategy layer and its contract are gone; the fold/group engine it drove stays, now human-operated only. See the Conductors section.
 - **the wire** — the messages array sent to the LLM provider. "Wire-valid" = the outgoing array is well-formed. Distinct from the WebSocket between the app and the pi extension (that's the live link / accordion protocol).
 - **browser-served** — mode where the pi extension HTTP-serves the SvelteKit UI on the same ephemeral port as the WS. Multi-session-aware (the served extension lists every live session over `/__accordion/sessions`); no Tauri desktop app required.
 - **CC** — Claude Code (as in "CC transcript", "CC browsing"). Read-only mode; sessions loaded from `~/.claude/projects/`.
@@ -28,8 +28,6 @@ Guidance for AI coding sessions. [VISION.md](VISION.md) = product north star · 
 | `app/src/lib/live/` | WS client, session discovery, CC transcript browsing |
 | `app/src-tauri/src/lib.rs` | Native Rust: session discovery + `~/.claude` reads |
 | `extension/accordion.ts` | Live pi extension — WS server + HTTP server (browser-served mode) |
-| `conductors/` | All context strategies — see [conductors/README.md](conductors/README.md) |
-| `conductors/contract/` | Shared conductor contract (dependency-free) |
 | `docs/` | ADRs + developer references |
 | `brand/accordion-brand-kit/brand.md` | Brand colors + typography source of truth |
 
@@ -41,7 +39,7 @@ Guidance for AI coding sessions. [VISION.md](VISION.md) = product north star · 
 
 - `types.ts` — `Block { id, kind, turn, order, text, tokens, toolName?, callId?, override, autoFolded, by }`. Kinds: `user · text · thinking · tool_call · tool_result`
 - `parse.ts` — pi / Claude Code JSONL → typed blocks. `tool_call` and `tool_result` are separate blocks sharing a `callId`. An assistant message's thinking/text/call blocks share an `id` prefix before `:`
-- `store.svelte.ts` — `AccordionStore` (Svelte runes); exposed as `window.__store`. `appendBlocks(blocks)` is the streaming seam used by the live link to add new blocks. **Protected working tail** (`protectTokens`, default `20_000`): `protectedFromIndex` marks the first block in the tail; both auto- and manual-`fold()` are refused inside it; a block that was auto-folded before entering the tail heals back to live; `pin()` remains allowed. `setProtect(n)` resizes and re-folds, wired to an on-bar draggable handle. Under the `tail-size` involvement lock (ADR 0011), the tail floor is lifted — the conductor may fold any block
+- `store.svelte.ts` — `AccordionStore` (Svelte runes); exposed as `window.__store`. `appendBlocks(blocks)` is the streaming seam used by the live link to add new blocks. **Protected working tail** (`protectTokens`, default `20_000`): `protectedFromIndex` marks the first block in the tail; manual `fold()` is refused inside it, and a fold the tail later grows over heals back to live; `pin()` remains allowed. `setProtect(n)` resizes and re-folds, wired to an on-bar draggable handle
 - `tokens.ts` — chars/4 estimate · `digest.ts` — what a kind collapses to when folded
 
 **Folding is content substitution, never removal** — provider-safe and fully reversible.
@@ -113,21 +111,17 @@ README surfaces:
 
 **RULE — preview/read-only is NOT a more permissive mode.**
 
-Demo, preview, and read-only Claude Code sessions obey EVERY rule the steering path does — same foldability predicate, same UI affordances, same token accounting, same group/conductor constraints. The *only* difference from steering is that no plan is written to the agent's wire. The UI must **never** render a fold, group, or state that the steering path could not itself produce. Involvement locks are locked in every mode — "there's no agent on the other end" is a forbidden line of reasoning.
+Demo, preview, and read-only Claude Code sessions obey EVERY rule the steering path does — same foldability predicate, same UI affordances, same token accounting, same group constraints. The *only* difference from steering is that no plan is written to the agent's wire. The UI must **never** render a fold, group, or state that the steering path could not itself produce.
 
 ---
 
 ## Conductors
 
-`conduct(view: ConductorView): Command[] | null` — the whole contract. `Command[]` = complete desired state (host resets to raw baseline and re-applies the batch); `[]` = clear to raw; `null` = hold last state. Accordion imposes no strategy of its own — no conductor attached = raw context. All conductors are first-party (this repo or a fork; no sandbox, no trust boundary). Folds from every conductor are attributed uniformly (`by:"auto"`).
+**Removed on this branch, pending a ground-up redesign.** The entire conductor strategy layer and its contract were excised: the `conduct(view) → Command[]` interface, the in-process/remote conductor runners, the built-in folder, attach/detach/consent, the out-of-band completion relay, and the whole `conductors/` tree (contract included). The `$conductors` alias, `docs/conductor-protocol.md`, and `docs/conductor-plan.md` are gone too. Accordion currently ships **no automatic context strategy** — context is raw unless a human folds/groups it by hand.
 
-**Contract:** `conductors/contract/conductor.ts` (in-process shapes: `ConductorView`, `Command` union, `Conductor`, `ConductorHost`) + `conductors/contract/protocol.ts` (WS wire shapes, which import the same types — one definition). Imported via `$conductors` alias.
+**Involvement locks (ADR 0011) are RESTORED as an engine capability.** The `human-steering` / `agent-unfold` / `tail-size` lock vocabulary lives in `engine/locks.ts` (`LockName`, `LOCK_NAMES`, `LOCK_LABELS`, `hasLock`, `isExclusive`), and the store holds the lock state behind a clean programmatic API: `setLocks(locks, holder, tailTokens?)` acquires (releasing existing human/agent holds in the newly-locked domains, ADR-0011 consent→baseline) and `clearLocks()` releases (restoring human seniority). `isLocked(name)`, the `locks` getter, and `lockHolder` are the read surface. The engine re-gates every human steering mutator under `human-steering`, the agent's `unfold` under `agent-unfold`, and `setProtect` / the protected-tail walk-back under `tail-size`; `recall` and observation/budget are sacred and never gated. The UI mirrors the gating (disabled affordances + a "locked by …" tooltip) in every mode. **NOTHING holds a lock yet** — locks are set only programmatically by tests today; the conductor redesign's host will drive `setLocks`/`clearLocks` and reinstate the consent flow + kill-switch freeze-on-detach. See [ADR 0011](docs/adr/0011-conductor-involvement-locks.md).
 
-**To add an in-process conductor:** drop a TS class in `conductors/<name>/`, register one line in `IN_PROCESS_CONDUCTORS` in `conductors/index.ts` — it appears in the header switcher. The host enforces one unconditional floor: **provider-validity** (the message stays sendable). The built-in (`conductors/builtin/builtin.ts`) is the minimal worked example; its output is pinned by a **golden test** (`conductor.builtin.test.ts`) — don't break it.
-
-**Involvement locks ([ADR 0011](docs/adr/0011-conductor-involvement-locks.md)).** A conductor may lock up to three steering controls: `human-steering` (hand fold/unfold/pin/group/reset), `agent-unfold`, and `tail-size`. A conductor that locks none is *collaborative* (the default). An exclusive conductor requires a one-time consent gate. The human's recourse is always **detach** — freezes the current view in place and unlocks all controls (not reset-to-raw; individual folds remain human-reversible). **Four things are never lockable:** observation (map, log, budget readout), the budget dial, the agent's `recall` tool, and detach itself.
-
-**Full references:** [conductors/README.md](conductors/README.md) — how to write one, worked examples, the full conductor catalog · [docs/conductor-protocol.md](docs/conductor-protocol.md) — ConductorView / ViewBlock / Command tables, WebSocket escape hatch, host capabilities.
+**What stays (the fold/group/protect engine, unchanged):** human fold/unfold/pin/unpin/reset, multiblock groups + wire-accurate `groupWire` accounting, the protected working tail + healing, budget/context-window aggregates, digests, and the agent `unfold` / `recall` tools with their provenance. `Block.autoFolded` and the `"auto"` actor are kept as **dormant plumbing** for the auto-folder the redesign will reintroduce; nothing sets them today. The `docs/adr/` records are retained as design history.
 
 ## Visual grammar
 
