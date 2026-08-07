@@ -81,6 +81,9 @@ export function readPalette(): Palette {
   const v = (name: string) => s.getPropertyValue(name).trim();
   return {
     kindColors: {
+      // Pale fixed-context yellow — the bolted `system` kind (v22). It uses the same dice-face
+      // weight grammar as every other block, plus neutral corner brackets drawn below.
+      system: v("--k-system") || "#FFF6A4",
       user: v("--k-user") || "#044EFF",
       text: v("--k-text") || "#1AA6E8",
       thinking: v("--k-thinking") || "#B480DF",
@@ -513,15 +516,13 @@ export function drawTile(
   }
 
   // ---- dice pips (blitted from sprite) ----
-  // Folded tiles KEEP their dice face (the old DOM showed pips at the cell's
-  // .36 opacity). Drawing them dimmed-but-visible keeps a folded block reading
-  // as "a recessed version of the colored tile," not a blank square.
+  // Every block kind, including the bolted `system` prompt, keeps the shared weight grammar.
+  // Folded tiles retain their face as a dim ghost so they still read as recessed versions of
+  // the same weighted block. (`system` can never fold, but using the common path here prevents
+  // its immutable status from erasing its token-size signal again.)
   const spriteCanvas = sprites.get(spec.face);
   if (spriteCanvas) {
     if (spec.folded) {
-      // Drained tiles read as near-black recessed squares — keep the pips a faint
-      // ghost (the weight is still legible up close) so the tile doesn't sprout
-      // loud white dots that fight the drain. Hover relights toward full.
       ctx.save();
       ctx.globalAlpha = opts.hovered ? 0.7 : 0.22;
       ctx.drawImage(spriteCanvas, x, y, w, h);
@@ -581,6 +582,62 @@ export function drawTile(
     ctx.stroke();
   }
 
+  // The system prompt is a normal weighted block with one extra immutable-context cue. Draw the
+  // brackets LAST so selection/hover overlays never cover them; they remain on the tile itself,
+  // inset from the ordinary selection ring rather than becoming an outside decoration.
+  if (spec.kind === "system") drawSystemCorners(ctx, x, y, w, h);
+
+  ctx.restore();
+}
+
+// ---------------------------------------------------------------------------
+// System corners — the BOLTED-kind mark (see CLAUDE.md "Visual grammar")
+// ---------------------------------------------------------------------------
+
+const SYSTEM_CORNER_COLOR = "#9A9A9A"; // Smoke — neutral, distinct from every block-kind hue
+const SYSTEM_CORNER_INSET_RATIO = 0.08;
+const SYSTEM_CORNER_ARM_RATIO = 0.18;
+const SYSTEM_CORNER_STROKE_RATIO = 0.045; // approved option J: heavy, same-length arms
+
+/**
+ * Draw four heavy Smoke-gray L brackets inside the system tile's corners. The ratios are the
+ * approved option J treatment: 8% inset, 18% arms, 4.5% stroke. The minimum stroke keeps the
+ * immutable cue legible at the grid's smallest densities without affecting dice-sprite caching.
+ */
+function drawSystemCorners(
+  ctx: CanvasRenderingContext2D,
+  x: number,
+  y: number,
+  w: number,
+  h: number,
+): void {
+  const size = Math.min(w, h);
+  const inset = size * SYSTEM_CORNER_INSET_RATIO;
+  const arm = size * SYSTEM_CORNER_ARM_RATIO;
+  const left = x + inset;
+  const right = x + w - inset;
+  const top = y + inset;
+  const bottom = y + h - inset;
+
+  ctx.save();
+  ctx.beginPath();
+  ctx.moveTo(left, top + arm);
+  ctx.lineTo(left, top);
+  ctx.lineTo(left + arm, top);
+  ctx.moveTo(right - arm, top);
+  ctx.lineTo(right, top);
+  ctx.lineTo(right, top + arm);
+  ctx.moveTo(right, bottom - arm);
+  ctx.lineTo(right, bottom);
+  ctx.lineTo(right - arm, bottom);
+  ctx.moveTo(left + arm, bottom);
+  ctx.lineTo(left, bottom);
+  ctx.lineTo(left, bottom - arm);
+  ctx.strokeStyle = SYSTEM_CORNER_COLOR;
+  ctx.lineWidth = Math.max(0.75, size * SYSTEM_CORNER_STROKE_RATIO);
+  ctx.lineCap = "square";
+  ctx.lineJoin = "miter";
+  ctx.stroke();
   ctx.restore();
 }
 
