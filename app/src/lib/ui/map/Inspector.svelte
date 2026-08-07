@@ -3,6 +3,7 @@
 	import { cubicOut } from "svelte/easing";
 	import type { AccordionStore } from "../../engine/store.svelte";
 	import type { Block, Group } from "../../engine/types";
+	import { isBolted } from "$core/digest";
 	import Icon from "$lib/ui/Icon.svelte";
 
 	let {
@@ -20,6 +21,7 @@
 	} = $props();
 
 	const KIND_LABEL: Record<Block["kind"], string> = {
+		system: "System",
 		user: "User",
 		text: "Reply",
 		thinking: "Thinking",
@@ -27,23 +29,25 @@
 		tool_result: "Tool result",
 	};
 
-	const CAP = 6000;
+	const HEAD_CAP = 3000;
+	const TAIL_CAP = 3000;
 	const fmt = (n: number) => n.toLocaleString();
 
 	const folded = $derived(block ? store.isFolded(block) : false);
 	const pinned = $derived(block?.override === "pinned");
+	const bolted = $derived(block ? isBolted(block) : false);
 	// Protected working tail — never folded (the safety pillar). The Fold control is
 	// disabled here so the guarantee is visible, not just enforced silently.
 	const protect = $derived(block ? store.isProtected(block) : false);
 
 	// Involvement locks (ADR 0011): under `human-steering` the human's fold / unfold / pin /
-	// group / reset controls are the conductor's, so they show disabled — the honest mirror of
+	// group / reset controls are the holder's, so they show disabled — the honest mirror of
 	// the engine's no-op. Observation (this whole panel's content, the digest, the partner
 	// preview) is NEVER gated; only the mutating buttons are. Drive purely off `store.isLocked`
 	// so it's correct in preview/demo/read-only too.
 	const steerLocked = $derived(store.isLocked("human-steering"));
 	const lockTip = $derived(
-		`Locked by ${store.lockingConductorLabel ?? "the active conductor"} — detach to take back control`,
+		`Locked by ${store.lockHolder ?? "the active strategy"} — release the lock to take back control`,
 	);
 
 	// the call/result partner — they're separate blocks sharing a callId
@@ -60,30 +64,49 @@
 	const canFoldPartner = $derived(partner ? store.canFold(partner) : false);
 	const partnerFolded = $derived(partner ? store.isFolded(partner) : false);
 
-	function body(b: Block): { text: string; clipped: number } {
+	function body(
+		b: Block,
+	): { text: string; clipped: number } | { head: string; tail: string; clipped: number; omitted: number } {
 		const t = b.text ?? "";
-		return t.length > CAP ? { text: t.slice(0, CAP) + "…", clipped: t.length } : { text: t, clipped: 0 };
+		if (t.length <= HEAD_CAP + TAIL_CAP) return { text: t, clipped: 0 };
+		return {
+			head: t.slice(0, HEAD_CAP),
+			tail: t.slice(-TAIL_CAP),
+			clipped: t.length,
+			omitted: t.length - HEAD_CAP - TAIL_CAP,
+		};
 	}
 
 	const bd = $derived(block ? body(block) : { text: "", clipped: 0 });
+
+	// flat single-slice preview for the compact partner strip (unlike the main content
+	// view, this one isn't split into head/tail — it's just a short peek)
+	function previewText(b: Block): string {
+		const t = b.text ?? "";
+		const cap = HEAD_CAP + TAIL_CAP;
+		return t.length > cap ? t.slice(0, cap) + "…" : t;
+	}
 
 	const isMono = $derived(block?.kind === "tool_call" || block?.kind === "tool_result");
 
 	// Block mode: is this block part of a group? Used to render the "part of group" link.
 	const inGroup = $derived(block ? store.groupOf(block) : null);
 
-	// Group mode derived values
+	// Group mode derived values. Token readouts calibrated (issue #11 stage 1) — display only.
 	const gMembers = $derived(group ? store.groupMembers(group) : []);
-	const gFullTok = $derived(group ? store.groupFullTokens(group) : 0);
-	const gLiveTok = $derived(group ? store.groupLiveTokens(group) : 0);
-	const gSavedTok = $derived(group ? store.groupSavedTokens(group) : 0);
+	const gFullTok = $derived(group ? store.calGroupFullTokens(group) : 0);
+	const gLiveTok = $derived(group ? store.calGroupLiveTokens(group) : 0);
+	const gSavedTok = $derived(gFullTok - gLiveTok);
+	// "≈" marker gate — a null receipt frontier covers cold start and every read-only/demo/CC/file
+	// session (no live host ever calibrates those), so no separate `readOnly` prop is needed here.
+	const notAnchored = $derived(store.calibrationThroughOrder === null);
 	const gStrag = $derived(group ? store.groupStragglerCount(group) : 0);
 	const gIsDropGroup = $derived(group ? store.isDropGroup(group) : false);
-	// The EXACT summary the agent receives for this group: the conductor's custom digest
-	// (e.g. naive compaction's LLM summary) when present, else the deterministic structural
-	// recap. Mirrors the wire (`plan.ts` → `store.groupSummary`) so this "shown to agent"
-	// panel never diverges from what the agent actually sees. (Drop groups return ""; this
-	// derived is only rendered in the non-drop branch.)
+	// The EXACT summary the agent receives for this group: a custom digest literal when the
+	// group carries one, else the deterministic structural recap. Mirrors the wire
+	// (`plan.ts` → `store.groupSummary`) so this "shown to agent" panel never diverges from
+	// what the agent actually sees. (Drop groups return ""; this derived is only rendered in
+	// the non-drop branch.)
 	const gDigest = $derived(group ? store.groupSummary(group) : "");
 	const gTurnFirst = $derived(gMembers.length > 0 ? gMembers[0].turn : 0);
 	const gTurnLast = $derived(gMembers.length > 0 ? gMembers[gMembers.length - 1].turn : 0);
@@ -131,8 +154,9 @@
 						</span>
 					{/if}
 				</div>
-				<!-- Token data row: tabular mono -->
+				<!-- Token data row: tabular mono. Calibrated (issue #11 stage 1) — display only. -->
 				<div class="tok-table mono">
+					{#if notAnchored}<span class="approx" aria-hidden="true">≈</span>{/if}
 					<span class="tok-row">
 						<span class="tok-key">full</span>
 						<span class="tok-val">{fmt(gFullTok)}</span>
@@ -239,7 +263,7 @@
 				</button>
 			{/if}
 			<span class="grow"></span>
-			<span class="turn-badge mono">turn {block.turn}</span>
+			<span class="turn-badge mono">{bolted ? "preamble" : `turn ${block.turn}`}</span>
 			<button class="close-btn" onclick={onclose} aria-label="Close inspector" title="Close">
 				<Icon name="x" size={16} />
 			</button>
@@ -265,29 +289,42 @@
 							protected
 						</span>
 					{/if}
+					{#if bolted}
+						<span class="pill pill-bolted" title="Permanent system context">
+							<Icon name="bolt" size={10} stroke={2} />
+							bolted
+						</span>
+					{/if}
 				</div>
-				<!-- Token data: tabular mono -->
+				<!-- Token data: tabular mono. Calibrated (issue #11 stage 1) — display only. -->
 				<div class="tok-table mono">
+					{#if notAnchored}<span class="approx" aria-hidden="true">≈</span>{/if}
 					{#if folded}
 						<span class="tok-row">
 							<span class="tok-key">full</span>
-							<span class="tok-val tok-struck">{fmt(block.tokens)}</span>
+							<span class="tok-val tok-struck">{fmt(store.calBlockTokens(block, block.tokens))}</span>
 						</span>
 						<span class="tok-sep-char">→</span>
 						<span class="tok-row">
 							<span class="tok-key">live</span>
-							<span class="tok-val tok-live">{fmt(store.effTokens(block))}</span>
+							<span class="tok-val tok-live">{fmt(store.calBlockTokens(block, store.effTokens(block)))}</span>
 						</span>
 					{:else}
 						<span class="tok-row">
 							<span class="tok-key">tokens</span>
-							<span class="tok-val tok-live">{fmt(block.tokens)}</span>
+							<span class="tok-val tok-live">{fmt(store.calBlockTokens(block, block.tokens))}</span>
 						</span>
 					{/if}
 				</div>
 			</div>
 
 			<!-- Actions -->
+			{#if bolted}
+				<div class="bolted-note">
+					<Icon name="bolt" size={15} stroke={2} />
+					<span>Permanent system context. It is always sent in full and cannot be folded, pinned, grouped, or replaced.</span>
+				</div>
+			{:else}
 			<div class="action-row">
 				<button
 					class="action-btn"
@@ -326,6 +363,7 @@
 					{pinned ? "Unpin" : "Pin"}
 				</button>
 			</div>
+			{/if}
 		</div>
 
 		<!-- ── Body ───────────────────────────────────────────────── -->
@@ -342,14 +380,24 @@
 				<span class="eyebrow section-eyebrow">Content</span>
 			{/if}
 
-			<pre
-				class="content"
-				class:content-mono={isMono}
-			>{bd.text}</pre>
+			{#if "text" in bd}
+				<pre
+					class="content"
+					class:content-mono={isMono}
+				>{bd.text}</pre>
+			{:else}
+				<pre
+					class="content"
+					class:content-mono={isMono}
+				>{bd.head}</pre>
+				<div class="gap-note mono">⋯ {fmt(bd.omitted)} chars omitted ⋯</div>
+				<pre
+					class="content"
+					class:content-mono={isMono}
+				>{bd.tail}</pre>
 
-			{#if bd.clipped}
 				<p class="clip-note mono">
-					showing first {fmt(CAP)} of {fmt(bd.clipped)} chars
+					showing first {fmt(HEAD_CAP)} and last {fmt(TAIL_CAP)} of {fmt(bd.clipped)} chars
 				</p>
 			{/if}
 		</div>
@@ -362,7 +410,7 @@
 						{partner.kind === "tool_result" ? "Result produced" : "Call that produced this"}
 					</span>
 					<span class="partner-meta mono">
-						{partnerFolded ? "folded" : "live"} · {fmt(store.effTokens(partner))} tok
+						{partnerFolded ? "folded" : "live"} · {#if notAnchored}≈{/if}{fmt(store.calBlockTokens(partner, store.effTokens(partner)))} tok
 					</span>
 				</div>
 
@@ -390,7 +438,7 @@
 					{partnerFolded ? "Unfold" : canFoldPartner ? "Fold" : partnerProtected ? "Protected" : "Fold"} partner
 				</button>
 
-				<pre class="partner-preview mono">{body(partner).text}</pre>
+				<pre class="partner-preview mono">{previewText(partner)}</pre>
 			</div>
 		{/if}
 	</aside>
@@ -504,6 +552,7 @@
 	}
 
 	/* kind color variables */
+	.k-system     { --kc: var(--k-system); }
 	.k-user       { --kc: var(--k-user); }
 	.k-text        { --kc: var(--k-text); }
 	.k-thinking    { --kc: var(--k-thinking); }
@@ -567,6 +616,29 @@
 		background: var(--accent-soft);
 		gap: 5px;
 	}
+	.pill-bolted {
+		color: var(--k-system);
+		border-color: color-mix(in srgb, var(--k-system) 50%, var(--line));
+		background: color-mix(in srgb, var(--k-system) 12%, transparent);
+	}
+
+	.bolted-note {
+		display: flex;
+		align-items: flex-start;
+		gap: var(--sp-2);
+		padding: var(--sp-3);
+		border: 1px solid color-mix(in srgb, var(--k-system) 40%, var(--line));
+		border-radius: var(--radius-sm);
+		background: color-mix(in srgb, var(--k-system) 8%, var(--panel-2));
+		color: var(--muted);
+		font-size: var(--fs-xs);
+		line-height: 1.45;
+	}
+	.bolted-note :global(svg) {
+		flex: 0 0 auto;
+		color: var(--k-system);
+		margin-top: 1px;
+	}
 
 	/* Token table: tabular mono data display */
 	.tok-table {
@@ -606,6 +678,10 @@
 	.tok-saved {
 		color: var(--ok);
 		font-size: var(--fs-xs);
+	}
+	/* "≈" marker — a bare (not provider-anchored) estimate, issue #11 stage 1. Monochrome, no new color. */
+	.approx {
+		color: var(--faint);
 	}
 
 	/* Action row: buttons laid out in a flex row */
@@ -807,6 +883,14 @@
 
 	.clip-note {
 		margin: 0;
+		font-size: var(--fs-xs);
+		color: var(--faint);
+		letter-spacing: 0.04em;
+	}
+
+	.gap-note {
+		margin: 0.5rem 0;
+		text-align: center;
 		font-size: var(--fs-xs);
 		color: var(--faint);
 		letter-spacing: 0.04em;

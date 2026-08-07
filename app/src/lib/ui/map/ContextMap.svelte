@@ -7,11 +7,14 @@
 	import { nextVacated } from "./drain";
 	import { buildDisplay, segmentDisplay, buildLane, type DisplayRow } from "$lib/engine/display";
 	import { settings } from "$lib/settings.svelte";
+	import { anotherSurfaceControls } from "$lib/live/liveClient.svelte";
+	import { attemptSteer, readOnlyTip } from "$lib/live/controllerUi.svelte";
 	import Icon from "$lib/ui/Icon.svelte";
 	import SegControl from "$lib/ui/SegControl.svelte";
 	import TileCanvas from "./TileCanvas.svelte";
 	import type { TileSpec } from "./tileDraw";
 	import { faceFor as faceForLib } from "./tileDraw";
+	import { isBolted } from "$core/digest";
 
 	let {
 		store,
@@ -27,6 +30,7 @@
 	let view = $state<"map" | "transcript">("map");
 	// Human-readable role label for a transcript message header.
 	const ROLE: Record<Block["kind"], string> = {
+		system: "System",
 		user: "You",
 		text: "Assistant",
 		thinking: "Thinking",
@@ -35,14 +39,25 @@
 	};
 
 	// Involvement locks (ADR 0011): under `human-steering` the human's fold/group controls are
-	// the conductor's. Double-click-to-fold becomes a no-op and is not advertised; the inline
+	// the holder's. Double-click-to-fold becomes a no-op and is not advertised; the inline
 	// transcript Fold button and the range→Group affordance disable. Single-click INSPECT and
 	// group PEEK stay enabled — observation is sacred, never lockable. Drive off `store.isLocked`
 	// so preview/demo/read-only mirror it exactly.
 	const steerLocked = $derived(store.isLocked("human-steering"));
 	const lockTip = $derived(
-		`Locked by ${store.lockingConductorLabel ?? "the active conductor"} — detach to take back control`,
+		`Locked by ${store.lockHolder ?? "the active strategy"} — release the lock to take back control`,
 	);
+
+	// READ-ONLY gate (v16, ADR 0024, spec Part 3): this store IS wire-controlled (a live pi
+	// session — never a demo/CC/file session, which are never wireControlled), but some OTHER
+	// surface currently holds the controller lease. Treated like `steerLocked` for the purposes of
+	// "can a fold/group mutation happen right now", except a blocked ATTEMPT (a double-click) also
+	// flashes the read-only hint near the cursor — steerLocked stays a silent no-op (unrelated,
+	// pre-existing conductor-lock behavior, out of scope here).
+	// U1: gated on `anotherSurfaceControls()` (a non-null FRESH foreign lease), NOT `!isController()` —
+	// a null/stale lease is uncontested (this surface silently auto-claims it) and must never render
+	// read-only chrome while that claim round-trips.
+	const notController = $derived(store.wireControlled && anotherSurfaceControls());
 
 	// ---- weight as dice faces: every tile is the same square; token weight is
 	//      read as a die face 1–6 (more pips = heavier block). -----------------
@@ -56,13 +71,18 @@
 		{ f: 5, lbl: "up to 15k tok" },
 		{ f: 6, lbl: "past 15k tok" },
 	] as const;
-	// Use the canonical faceFor from tileDraw (single source of truth).
-	const faceFor = faceForLib;
+	// Use the canonical faceFor from tileDraw (single source of truth) — every call site below feeds
+	// it a CALIBRATED token count (issue #11 stage 2, ADR 0025) so a tile's die-face weight matches
+	// what the rest of the UI now reports as that block's real size, not the raw chars/4 estimate.
+	// Wrapped once here (rather than at each call site) so `faceFor(x)` stays a drop-in raw-tokens-in
+	// call everywhere it's already used; the canvas/sprite machinery `faceForLib` feeds is untouched.
+	const faceFor = (tokens: number, block?: Block) => faceForLib(block ? store.calBlockTokens(block, tokens) : tokens);
 
 	// Color = kind legend (toolbar). Each block kind owns one spectrum hue (--k-*);
 	// this names them so the grid's colours are self-explaining. Order follows the
 	// conversation grammar: you → reply → thinking → tool call → tool result.
 	const KINDS: { kind: BlockKind; lbl: string }[] = [
+		{ kind: "system", lbl: "system" },
 		{ kind: "user", lbl: "user" },
 		{ kind: "text", lbl: "reply" },
 		{ kind: "thinking", lbl: "thinking" },
@@ -77,7 +97,7 @@
 
 	// ---- grid tiles: every block is the same square, in conversation order.
 	//      uniform size ⇒ strict order with no reflow holes (linearity for free).
-	const tiles = $derived(store.blocks.map((b) => ({ b, face: faceFor(b.tokens) })));
+	const tiles = $derived(store.blocks.map((b) => ({ b, face: faceFor(b.tokens, b) })));
 	const count = $derived(store.blocks.length);
 	// the protected working tail — newest blocks the auto-folder never touches.
 	// split the grid into two boxes: older/foldable (top) and protected (bottom).
@@ -128,7 +148,7 @@
 				out.push({
 					id: b.id,
 					kind: b.kind,
-					face: faceFor(b.tokens),
+					face: faceFor(b.tokens, b),
 					folded: store.isFolded(b),
 					pinned: b.override === "pinned",
 					selected: b.id === selectedId,
@@ -140,7 +160,7 @@
 				out.push({
 					id: g.id,
 					kind: "group",
-					face: store.isDropGroup(g) ? 0 : faceFor(store.groupLiveTokens(g)),
+					face: store.isDropGroup(g) ? 0 : faceFor(store.calGroupLiveTokens(g)),
 					folded: false,
 					pinned: false,
 					selected: selectedId === g.id,
@@ -173,7 +193,7 @@
 			out.push({
 				id: b.id,
 				kind: b.kind,
-				face: faceFor(b.tokens),
+				face: faceFor(b.tokens, b),
 				folded: store.isFolded(b),
 				pinned: b.override === "pinned",
 				selected: b.id === selectedId,
@@ -367,49 +387,61 @@
 	});
 
 	const k = (n: number) => { n = Math.round(n); return n >= 1000 ? `${(n / 1000).toFixed(n >= 10000 ? 0 : 1)}k` : `${n}`; };
+	// issue #102: "≈" marker gate for the transcript's visible token badge — a null receipt frontier
+	// covers BOTH cold start (no observation yet) and every read-only/demo/CC/file session (no live
+	// host ever calibrates those), so no separate `readOnly` prop plumbing is needed here.
+	const notAnchored = $derived(store.calibrationThroughOrder === null);
 	function tip(b: Block, prot = false): string {
 		const tool = b.toolName ? ` ${b.toolName}` : "";
 		const folded = store.isFolded(b);
-		const f = folded ? ` · folded ${b.tokens}→${store.effTokens(b)}` : "";
+		// Token readouts calibrated (issue #11 stage 1) — display only, the fold/protect gating logic
+		// below this stays on the raw `store.canFold`/`prot` decision.
+		const f = folded ? ` · folded ${store.calBlockTokens(b, b.tokens)}→${store.calBlockTokens(b, store.effTokens(b))}` : "";
 		// The hint mirrors what a double-click actually DOES — steerLocked makes it a no-op, else
 		// store.toggle gated by canFold — so the tile never advertises a fold the gate would refuse:
-		// a conductor lock, a live user/tool_call, a pin, or the protected tail. Unfold stays for a folded block.
-		const action = steerLocked
-			? "click to inspect · folding locked by the conductor"
-			: folded
-				? "click to inspect · double-click to unfold"
-				: store.canFold(b)
-					? "click to inspect · double-click to fold"
-					: prot
-						? "click to inspect · protected — never folds"
-						: b.override === "pinned"
-							? "click to inspect · pinned — held live"
-							: "click to inspect · this kind never folds";
-		return `${b.kind}${tool} · ${b.tokens.toLocaleString()} tok${f}\n${action}`;
+		// a human-steering lock, read-only (v16, ADR 0024), a live user/tool_call, a pin, or the
+		// protected tail. Unfold stays for a folded block.
+		const action = b.kind === "system"
+			? "click to inspect · bolted — permanent system context"
+			: steerLocked
+			? "click to inspect · folding locked by the active strategy"
+			: notController
+				? `click to inspect · ${readOnlyTip("fold")}`
+				: folded
+					? "click to inspect · double-click to unfold"
+					: store.canFold(b)
+						? "click to inspect · double-click to fold"
+						: prot
+							? "click to inspect · protected — never folds"
+							: b.override === "pinned"
+								? "click to inspect · pinned — held live"
+								: "click to inspect · this kind never folds";
+		return `${b.kind}${tool} · ${store.calBlockTokens(b, b.tokens).toLocaleString()} tok${f}\n${action}`;
 	}
 	function groupTip(g: Group): string {
 		const members = store.groupMembers(g);
-		const full = store.groupFullTokens(g);
-		const saved = store.groupSavedTokens(g);
+		const full = store.calGroupFullTokens(g);
+		const saved = full - store.calGroupLiveTokens(g);
 		const strag = store.groupStragglerCount(g);
 		const turns = members.length > 0
 			? `turns ${members[0].turn}–${members[members.length - 1].turn}`
 			: "";
 		const savedStr = saved > 0 ? ` · saves ${k(saved)} tok` : "";
 		const stragStr = strag > 0 ? ` · ${strag} kept live` : "";
+		const collapseHint = notController ? readOnlyTip("fold") : "double-click to collapse";
 		if (store.isDropGroup(g)) {
 			return `drop group · ${members.length} blocks · ${k(saved)} tok removed${stragStr}\n${turns}\nThe agent does not see this block\nclick to inspect`;
 		}
-		return `group · ${members.length} blocks · ${k(full)} tok full${savedStr}${stragStr}\n${turns}\nclick to peek · double-click to collapse`;
+		return `group · ${members.length} blocks · ${k(full)} tok full${savedStr}${stragStr}\n${turns}\nclick to peek · ${collapseHint}`;
 	}
 
 	// ---- sliver mode helpers ------------------------------------------------
 
 	/** Title for an ungrouped fold's cocoa block — the digest now standing in for the block.
 	 *  The dice face on the cocoa shows ITS size (the digest); the sliver beside it carries the
-	 *  original block's weight. */
+	 *  original block's weight. Token readout calibrated (issue #11 stage 1) — display only. */
 	function foldTip(b: Block): string {
-		return `folded · ${k(b.tokens)}→${k(store.effTokens(b))} tok · click to inspect · double-click to unfold`;
+		return `folded · ${k(store.calBlockTokens(b, b.tokens))}→${k(store.calBlockTokens(b, store.effTokens(b)))} tok · click to inspect · double-click to unfold`;
 	}
 
 	// ---- range selection state (local — for creating groups) ----------------
@@ -439,12 +471,17 @@
 		rangeEndId = null;
 		groupErr = false;
 	}
-	function handleCreateGroup() {
+	function handleCreateGroup(e?: MouseEvent) {
 		if (!rangeAnchorId || !rangeEndId) return;
-		const g = store.createGroup(rangeAnchorId, rangeEndId);
-		// Only clear on success; on failure keep the selection and say why (no silent drop).
-		if (g) clearRange();
-		else groupErr = true;
+		attemptSteer(
+			{ live: true, isController: !notController, verb: "fold", x: e?.clientX ?? 0, y: e?.clientY ?? 0 },
+			() => {
+				const g = store.createGroup(rangeAnchorId!, rangeEndId!);
+				// Only clear on success; on failure keep the selection and say why (no silent drop).
+				if (g) clearRange();
+				else groupErr = true;
+			},
+		);
 	}
 
 	// A pending range-select / peek set is bound to the CURRENT session and the grid view.
@@ -459,11 +496,12 @@
 			peeked = new Set();
 		});
 	});
-	// ADR 0011: when the human-steering lock becomes active, any pending range must be
-	// cleared immediately — a range selected just before the lock engages would otherwise
-	// linger and mislead the user into a guaranteed-to-fail "Group" attempt.
+	// ADR 0011 / ADR 0024: when the human-steering lock engages, OR this surface stops being the
+	// controller, any pending range must be cleared immediately — a range selected just before
+	// either engages would otherwise linger and mislead the user into a guaranteed-to-fail
+	// "Group" attempt.
 	$effect(() => {
-		if (steerLocked) {
+		if (steerLocked || notController) {
 			untrack(() => clearRange());
 		}
 	});
@@ -545,11 +583,11 @@
 	function handleBlockClick(id: string, shiftKey: boolean) {
 		const bl = store.get(id);
 		// Range-select only exists to build a group — a human-steering action. Under the lock
-		// it's inert; a click just inspects (observation stays). So skip all range bookkeeping.
-		// Range-select is a map-only gesture.
-		if (!steerLocked && view === "map" && shiftKey && rangeAnchorId) {
+		// (or read-only — v16, ADR 0024) it's inert; a click just inspects (observation stays). So
+		// skip all range bookkeeping. Range-select is a map-only gesture.
+		if (!steerLocked && !notController && view === "map" && shiftKey && rangeAnchorId) {
 			clearPendingClick();
-			if (!bl || store.isProtected(bl) || store.groupOf(bl)) {
+			if (!bl || isBolted(bl) || store.isProtected(bl) || store.groupOf(bl)) {
 				groupErr = true;
 				return;
 			}
@@ -560,7 +598,9 @@
 		deferClick(() => {
 			onselect(id);
 			rangeAnchorId =
-				!steerLocked && view === "map" && bl && !store.isProtected(bl) && !store.groupOf(bl) ? id : null;
+				!steerLocked && !notController && view === "map" && bl && !isBolted(bl) && !store.isProtected(bl) && !store.groupOf(bl)
+					? id
+					: null;
 			rangeEndId = null;
 			groupErr = false;
 		});
@@ -586,11 +626,15 @@
 		clearPendingClick();
 		if (steerLocked) return; // double-click folds, which is locked — no-op (observation is fine)
 		if (e.kind === "group") {
-			collapseGroup(e.id);
+			attemptSteer({ live: true, isController: !notController, verb: "fold", x: _ev.clientX, y: _ev.clientY }, () =>
+				collapseGroup(e.id),
+			);
 		} else {
 			const b = store.get(e.id);
 			if (b && !store.isFolded(b) && !store.canFold(b)) return;
-			store.toggle(e.id);
+			attemptSteer({ live: true, isController: !notController, verb: "fold", x: _ev.clientX, y: _ev.clientY }, () =>
+				store.toggle(e.id),
+			);
 		}
 	}
 
@@ -645,19 +689,22 @@
 		clearPendingClick();
 		if (steerLocked) return; // double-click folds/unfolds — locked → no-op (single-click inspect still works)
 		const hit = resolveHit(e);
-		if (hit.kind === "group") {
-			collapseGroup(hit.gid);
-		} else if (hit.kind === "block") {
-			const b = store.get(hit.id);
-			if (b && !store.isFolded(b) && !store.canFold(b)) return;
-			store.toggle(hit.id);
-		} else if (hit.kind === "summary") {
-			// Double-click summary → unfold the whole run.
-			for (const id of hit.memberIds) {
-				const b = store.get(id);
-				if (b && store.isFolded(b)) store.toggle(id);
+		if (hit.kind === "none") return;
+		attemptSteer({ live: true, isController: !notController, verb: "fold", x: e.clientX, y: e.clientY }, () => {
+			if (hit.kind === "group") {
+				collapseGroup(hit.gid);
+			} else if (hit.kind === "block") {
+				const b = store.get(hit.id);
+				if (b && !store.isFolded(b) && !store.canFold(b)) return;
+				store.toggle(hit.id);
+			} else if (hit.kind === "summary") {
+				// Double-click summary → unfold the whole run.
+				for (const id of hit.memberIds) {
+					const b = store.get(id);
+					if (b && store.isFolded(b)) store.toggle(id);
+				}
 			}
-		}
+		});
 	}
 
 	function onKeydown(e: KeyboardEvent) {
@@ -925,7 +972,7 @@
 					</span>
 					{#if groupErr && !steerLocked}<span class="range-err">overlaps a group or protected tail</span>{/if}
 					{#if steerLocked}
-						<span class="range-err" title={lockTip}>Locked by conductor</span>
+						<span class="range-err" title={lockTip}>Locked</span>
 					{:else}
 						<button class="group-btn" onclick={handleCreateGroup}>Group</button>
 					{/if}
@@ -972,7 +1019,11 @@
 			<div class="tb-divider"></div>
 
 			<span class="dim" style="font-size:var(--fs-xs)">
-				{steerLocked ? "click = inspect · folding locked by the conductor" : "click = inspect · dbl-click = fold"}
+				{steerLocked
+					? "click = inspect · folding locked by the active strategy"
+					: notController
+						? "click = inspect · read-only — take control to fold"
+						: "click = inspect · dbl-click = fold"}
 			</span>
 		{/if}
 	</div>
@@ -1010,7 +1061,7 @@
 				<!-- The ORIGINAL folded block as a thin sliver; white lines = its weight (die face).
 				     `interactive` slivers carry data-id (click=inspect / dbl=unfold); group-member
 				     slivers are display-only (the group's cocoa owns the interaction). -->
-				{@const face = faceFor(b.tokens)}
+				{@const face = faceFor(b.tokens, b)}
 				{@const usable = cell - 4}
 				{@const gap = face > 1 ? Math.min(4, usable / (face - 1)) : 0}
 				{@const barStart = cell / 2 - (gap * (face - 1)) / 2}
@@ -1020,7 +1071,7 @@
 					class:inrange={rangeSet.has(b.id)}
 					style:height="{cell}px"
 					data-id={interactive ? b.id : undefined}
-					title={interactive ? foldTip(b) : `folded · ${k(b.tokens)} tok · grouped`}
+					title={interactive ? foldTip(b) : `folded · ${k(store.calBlockTokens(b, b.tokens))} tok · grouped`}
 				>
 					{#each { length: face } as _, n}
 						<div class="bar" style:top="{barStart + n * gap}px"></div>
@@ -1043,7 +1094,7 @@
 												{#if item.kind === "tile"}
 													{@const b = item.block}
 													<div
-														class="cell face f{faceFor(b.tokens)} k-{b.kind}"
+												class="cell face f{faceFor(b.tokens, b)} k-{b.kind}"
 														class:sel={b.id === selectedId}
 														class:pinned={b.override === "pinned"}
 														class:inrange={rangeSet.has(b.id)}
@@ -1059,7 +1110,7 @@
 											     is its own unit — never merged with neighbours. -->
 											<div class="fold-cluster" data-cluster-ids={b.id}>
 												<div
-													class="cell face f{faceFor(store.effTokens(b))} summary-tile"
+											class="cell face f{faceFor(store.calBlockTokens(b, store.effTokens(b)))} summary-tile"
 													class:sel={b.id === selectedId}
 													class:inrange={rangeSet.has(b.id)}
 													style:width="{cell}px"
@@ -1075,7 +1126,7 @@
 											     the cocoa owns peek/collapse via data-group, like the old group tile). -->
 											<div class="fold-cluster" data-cluster-ids={item.members.map((m) => m.id).join(",")}>
 												<div
-													class="cell face f{store.isDropGroup(g) ? 0 : faceFor(store.groupLiveTokens(g))} summary-tile group-cocoa"
+											class="cell face f{store.isDropGroup(g) ? 0 : faceFor(store.calGroupLiveTokens(g))} summary-tile group-cocoa"
 													class:drop-group={store.isDropGroup(g)}
 													class:sel={selectedId === g.id}
 													style:width="{cell}px"
@@ -1111,7 +1162,7 @@
 									     Member tiles are still DOM .cell elements — resolveHit handles them. -->
 									<div class="group-band" class:live data-group={g.id}>
 										<div
-											class="cell face f{store.isDropGroup(g) ? 0 : faceFor(store.groupLiveTokens(g))} group-tile group-tile-open"
+										class="cell face f{store.isDropGroup(g) ? 0 : faceFor(store.calGroupLiveTokens(g))} group-tile group-tile-open"
 											class:drop-group={store.isDropGroup(g)}
 											class:sel={selectedId === g.id}
 											data-group={g.id}
@@ -1121,7 +1172,7 @@
 										></div>
 										<div class="band-members">
 											{#each seg.row.members as mb (mb.id)}
-												{@const mt = { b: mb, face: faceFor(mb.tokens) }}
+												{@const mt = { b: mb, face: faceFor(mb.tokens, mb) }}
 												{@render tile(mt, false, !live)}
 											{/each}
 										</div>
@@ -1172,9 +1223,11 @@
 							<span class="tr-role">{ROLE[b.kind]}</span>
 							{#if b.toolName}<span class="tr-tool mono">{b.toolName}</span>{/if}
 							<span class="tr-tok mono tnum">
-								{k(store.effTokens(b))}{#if folded}<span class="dim">/{k(b.tokens)}</span>{/if} tok
+								{#if notAnchored}<span class="approx" aria-hidden="true">≈</span>{/if}{k(store.calBlockTokens(b, store.effTokens(b)))}{#if folded}<span class="dim">/{k(store.calBlockTokens(b, b.tokens))}</span>{/if} tok
 							</span>
-							{#if prot}
+							{#if b.kind === "system"}
+								<span class="tr-flag" title="Bolted — permanent system context"><Icon name="bolt" size={11} /></span>
+							{:else if prot}
 								<span class="tr-flag" title="protected working tail — never folds"><Icon name="lock" size={10} /></span>
 							{:else if b.override === "pinned"}
 								<span class="tr-flag" title="pinned — held full"><Icon name="pin" size={10} /></span>
@@ -1184,10 +1237,17 @@
 								<button
 									class="tr-btn"
 									class:locked={steerLocked}
+									class:ro-dim={notController}
 									disabled={steerLocked}
-									aria-disabled={steerLocked}
-									onclick={(e) => { e.stopPropagation(); store.toggle(b.id); }}
-									title={steerLocked ? lockTip : folded ? "Unfold to full text" : "Fold to digest"}
+									aria-disabled={steerLocked || notController}
+									onclick={(e) => {
+										e.stopPropagation();
+										attemptSteer(
+											{ live: true, isController: !notController, verb: "fold", x: e.clientX, y: e.clientY },
+											() => store.toggle(b.id),
+										);
+									}}
+									title={steerLocked ? lockTip : notController ? readOnlyTip("fold") : folded ? "Unfold to full text" : "Fold to digest"}
 								>
 									<Icon name={folded ? "chevrons-up-down" : "chevrons-down-up"} size={12} />
 									{folded ? "Unfold" : "Fold"}
@@ -1262,6 +1322,10 @@
 	.dim {
 		color: var(--faint);
 	}
+	/* "≈" marker — a bare (not provider-anchored) estimate, issue #11 stage 1. Monochrome, no new color. */
+	.approx {
+		color: var(--faint);
+	}
 
 	/* ---- token-tier legend ---- */
 	.tiers {
@@ -1301,6 +1365,7 @@
 		box-shadow: inset 0 0 0 1px rgba(0, 0, 0, 0.25);
 	}
 	.ksw.k-user { background: var(--k-user); }
+	.ksw.k-system { background: var(--k-system); }
 	.ksw.k-text { background: var(--k-text); }
 	.ksw.k-thinking { background: var(--k-thinking); }
 	.ksw.k-tool_call { background: var(--k-tool_call); }
@@ -1584,7 +1649,6 @@
 		background: var(--panel);
 		box-shadow: 0 0 0 1px color-mix(in srgb, var(--accent) 18%, transparent), var(--shadow-1);
 	}
-
 	/* canvas-fill: flex wrapper for TileCanvas inside a box (fills the space after the rail). */
 	.canvas-fill {
 		flex: 1;
@@ -1615,6 +1679,7 @@
 		box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.3);
 		z-index: 2;
 	}
+	.cell.k-system { background: var(--k-system); }
 	.cell.k-user { background: var(--k-user); }
 	.cell.k-text { background: var(--k-text); }
 	.cell.k-thinking { background: var(--k-thinking); }
@@ -1951,6 +2016,7 @@
 		border-left-color: var(--kc);
 		box-shadow: 0 0 0 1px var(--accent-soft);
 	}
+	.tr-msg.k-system { --kc: var(--k-system); }
 	.tr-msg.k-user { --kc: var(--k-user); }
 	.tr-msg.k-text { --kc: var(--k-text); }
 	.tr-msg.k-thinking { --kc: var(--k-thinking); }
@@ -2037,18 +2103,40 @@
 		outline: none;
 		box-shadow: var(--focus-ring);
 	}
-	/* human-steering locked: the inline Fold control shows disabled (the honest mirror). */
-	.tr-btn.locked,
 	.tr-btn:disabled {
 		cursor: not-allowed;
 		opacity: 0.4;
 	}
+	.tr-btn:disabled:hover {
+		color: var(--muted);
+		background: var(--panel-2);
+		border-color: var(--line);
+	}
+	/* human-steering locked: the inline Fold control shows disabled (the honest mirror) —
+	   held dim even on row hover / selection, which otherwise force opacity back to 1. */
 	.tr-msg:hover .tr-btn.locked,
 	.tr-msg.sel .tr-btn.locked {
 		opacity: 0.4;
 	}
-	.tr-btn.locked:hover,
-	.tr-btn:disabled:hover {
+	.tr-btn.locked:hover {
+		color: var(--muted);
+		background: var(--panel-2);
+		border-color: var(--line);
+	}
+
+	/* READ-ONLY "whisper" treatment (v16, ADR 0024): some OTHER surface holds the controller
+	   lease. Stays CLICKABLE (unlike `.locked`, which is natively `disabled`) so a click can flash
+	   the blocked-interaction hint — held dim even on row hover/selection/focus, same pattern as
+	   `.locked` above. */
+	.tr-msg:hover .tr-btn.ro-dim,
+	.tr-msg.sel .tr-btn.ro-dim,
+	.tr-btn.ro-dim:focus-visible {
+		opacity: 0.35;
+	}
+	.tr-btn.ro-dim {
+		cursor: not-allowed;
+	}
+	.tr-btn.ro-dim:hover {
 		color: var(--muted);
 		background: var(--panel-2);
 		border-color: var(--line);

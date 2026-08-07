@@ -1,6 +1,7 @@
 import { describe, it, expect } from "vitest";
 import { AccordionStore } from "./store.svelte";
 import type { Block, ParsedSession } from "./types";
+import { Truth } from "$core/truth";
 
 // A protected block is NEVER folded — by the auto-folder OR the user. This is the
 // safety pillar; these tests lock it so it can't silently regress.
@@ -34,10 +35,12 @@ function makeStore(nOrTokens: number | number[], tokens = 1000): AccordionStore 
 }
 
 describe("protected working tail is never folded", () => {
-	it("auto-folder folds old blocks but never a protected one", () => {
+	it("folded old blocks are all older than the protected boundary", () => {
 		const s = makeStore(5); // 5×1000 tok
 		s.setProtect(2000); // protects the newest two (indices 3,4)
-		s.setBudget(2500); // 5000 live > budget → must auto-fold
+		// The auto-folder was removed on this branch; drive the same guarantee with manual
+		// folds. fold() folds the old blocks and refuses the protected ones.
+		for (const b of s.blocks) s.fold(b.id);
 
 		expect(s.protectedFromIndex).toBe(3);
 		expect(s.foldedCount).toBeGreaterThan(0); // it actually folded something (regression guard)
@@ -140,5 +143,72 @@ describe("appendBlocks is idempotent by id", () => {
 		const before = s.blocks.length;
 		s.appendBlocks([blk(5, 500), blk(6, 500)]); // two fresh ids
 		expect(s.blocks.length).toBe(before + 2);
+	});
+});
+
+// setContextWindow / appendBlocks / setLocks / clearLocks / the `groups` setter / the
+// `wireAttached` setter write wire FACTS straight to the local Truth — unlike fold/pin/setBudget/
+// setProtect, they never route through commandSink. In live replica mode those same facts arrive
+// ONLY via `replayEvent` (liveClient.svelte.ts), which mutates the Truth directly and never calls
+// these methods — so calling one of them while a command sink is installed is always a bug. They
+// must throw rather than silently fork the replica away from the host.
+describe("local-only mutators refuse to run while a command sink is installed", () => {
+	it("setContextWindow / appendBlocks / setLocks / clearLocks / groups= / wireAttached= all throw when live", () => {
+		const s = makeStore(2);
+		s.setCommandSink(() => {}); // simulate live replica mode
+		expect(() => s.setContextWindow(1000)).toThrow();
+		expect(() => s.appendBlocks([blk(9, 500)])).toThrow();
+		expect(() => s.setLocks(["human-steering"], "host")).toThrow();
+		expect(() => s.clearLocks()).toThrow();
+		expect(() => {
+			s.groups = [];
+		}).toThrow();
+		expect(() => {
+			s.wireAttached = true;
+		}).toThrow();
+	});
+
+	it("the same six calls apply normally once the command sink is cleared", () => {
+		const s = makeStore(2);
+		s.setCommandSink(() => {});
+		s.setCommandSink(null); // back to local mode
+		expect(() => s.setContextWindow(1000)).not.toThrow();
+		expect(() => s.appendBlocks([blk(9, 500)])).not.toThrow();
+		expect(() => s.setLocks(["human-steering"], "host")).not.toThrow();
+		expect(() => s.clearLocks()).not.toThrow();
+		expect(() => {
+			s.groups = [];
+		}).not.toThrow();
+		expect(() => {
+			s.wireAttached = true;
+		}).not.toThrow();
+	});
+});
+
+// Issue #93: like `calibration`, `systemPrompt` is HOST-SET ONLY — there is no store-side setter a
+// UI action can call. It arrives purely as a mirrored read: seeded from the wrapped Truth at
+// construction, then kept in sync via the "config" case of `applyTruthEvent` whenever the Truth
+// underneath (a replica in live mode, replaying a wire event) emits one.
+describe("systemPrompt mirrors the wrapped Truth's config dial", () => {
+	it("seeds null when the Truth has no captured system prompt yet", () => {
+		const s = makeStore(2);
+		expect(s.systemPrompt).toBe(null);
+	});
+
+	it("seeds from an existingTruth that already has one captured (replica hydration path)", () => {
+		const parsed: ParsedSession = { meta: { format: "pi", title: "t", cwd: "", model: "" }, blocks: [], lineCount: 0, skipped: 0 };
+		const truth = new Truth(parsed);
+		truth.setSystemPrompt("You are a helpful assistant.", 8);
+		const s = new AccordionStore(parsed, truth);
+		expect(s.systemPrompt).toEqual({ text: "You are a helpful assistant.", tokens: 8 });
+	});
+
+	it("updates reactively when the underlying Truth emits a systemPrompt config event", () => {
+		const parsed: ParsedSession = { meta: { format: "pi", title: "t", cwd: "", model: "" }, blocks: [], lineCount: 0, skipped: 0 };
+		const truth = new Truth(parsed);
+		const s = new AccordionStore(parsed, truth);
+		expect(s.systemPrompt).toBe(null);
+		truth.setSystemPrompt("captured mid-session", 3); // mirrors a replica replaying an `applyWireEvent` config case
+		expect(s.systemPrompt).toEqual({ text: "captured mid-session", tokens: 3 });
 	});
 });
