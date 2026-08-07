@@ -4,12 +4,13 @@
  * There was no dedicated protocol-guard test file before Phase C's v13 additions (the app side
  * exercises `isServerMessage`/`isWireBlock` only indirectly, through `liveClient.svelte.ts`'s
  * message pump). This file targets `isServerMessage`/`isClientMessage` directly: every message
- * `type` the v13 protocol introduces must be ACCEPTED (the guards vet only the `type` tag — an
+ * `type` the protocol introduces must be ACCEPTED (the guards vet only the `type` tag — an
  * authorized peer may still send a malformed body, which is each consumer's job to guard further),
- * and an unrecognized/malformed `type` must be REJECTED by both.
+ * and an unrecognized/malformed `type` must be REJECTED by both. v14 adds the client-side
+ * `holdRelease`/`cancelComplete` messages and a `holdId` on `wireDeparting`.
  */
 import { describe, it, expect } from "vitest";
-import { isServerMessage, isClientMessage, PROTOCOL_VERSION } from "./protocol";
+import { isServerMessage, isClientMessage, sanitizeCommand, PROTOCOL_VERSION } from "./protocol";
 import type {
 	HelloMessage,
 	ActiveConductorMeta,
@@ -23,12 +24,14 @@ import type {
 	ProposeMessage,
 	CompleteRequestMessage,
 	SetConductorStatusMessage,
+	HoldReleaseMessage,
+	CancelCompleteMessage,
 	WireCommand,
 } from "./protocol";
 
 describe("PROTOCOL_VERSION", () => {
-	it("is bumped to 13 for the Phase C additions", () => {
-		expect(PROTOCOL_VERSION).toBe(13);
+	it("is bumped to 15 for the SnapshotState.carriedSent addition (sent-frontier carry across a rebuild)", () => {
+		expect(PROTOCOL_VERSION).toBe(15);
 	});
 });
 
@@ -75,8 +78,8 @@ describe("isServerMessage — v13 additions", () => {
 		expect(isServerMessage(msg)).toBe(true);
 	});
 
-	it("accepts wireDeparting", () => {
-		const msg: WireDepartingMessage = { type: "wireDeparting", rev: 3, liveTokens: 400, budget: 70_000, freshIds: ["a:b0:p0"], holdMs: 150 };
+	it("accepts wireDeparting (carrying the v14 holdId)", () => {
+		const msg: WireDepartingMessage = { type: "wireDeparting", rev: 3, liveTokens: 400, budget: 70_000, freshIds: ["a:b0:p0"], holdMs: 150, holdId: 1 };
 		expect(isServerMessage(msg)).toBe(true);
 	});
 
@@ -126,6 +129,16 @@ describe("isClientMessage — v13 additions", () => {
 		expect(isClientMessage(msg)).toBe(true);
 	});
 
+	it("accepts holdRelease (v14 wire-departing hold release)", () => {
+		const msg: HoldReleaseMessage = { type: "holdRelease", holdId: 7 };
+		expect(isClientMessage(msg)).toBe(true);
+	});
+
+	it("accepts cancelComplete (v14 completion abort forwarding)", () => {
+		const msg: CancelCompleteMessage = { type: "cancelComplete", reqId: 3 };
+		expect(isClientMessage(msg)).toBe(true);
+	});
+
 	it("still accepts the pre-v13 command/resnapshot shapes", () => {
 		expect(isClientMessage({ type: "command", seq: 1, cmd: { kind: "setBudget", value: 1000 } })).toBe(true);
 		expect(isClientMessage({ type: "resnapshot" })).toBe(true);
@@ -144,5 +157,37 @@ describe("WireCommand — selectConductor (type-level shape, v13)", () => {
 		const detach: WireCommand = { kind: "selectConductor", id: null };
 		expect(attach.kind).toBe("selectConductor");
 		expect(detach.id).toBeNull();
+	});
+});
+
+// The numeric-dial ingress gate: an authorized-but-buggy client can send a `command` whose `cmd`
+// carries a NaN/Infinity/negative budget/protect, which would poison Truth's dial and fork replicas
+// (JSON serializes NaN/Infinity as null). `sanitizeCommand` coerces or refuses before Truth ever
+// sees it. `ops` commands route through `sanitizeOps` (structural per-op gate).
+describe("sanitizeCommand — numeric-dial + ops ingress gate (fix #5)", () => {
+	it("refuses a NaN / Infinity / non-number setBudget (would poison the dial + fork replicas)", () => {
+		expect(sanitizeCommand({ kind: "setBudget", value: NaN })).toBeNull();
+		expect(sanitizeCommand({ kind: "setBudget", value: Infinity })).toBeNull();
+		expect(sanitizeCommand({ kind: "setBudget", value: "50000" })).toBeNull();
+	});
+	it("clamps a negative setProtect to ≥0 and passes a finite value through", () => {
+		expect(sanitizeCommand({ kind: "setProtect", value: -5 })).toEqual({ kind: "setProtect", value: 0 });
+		expect(sanitizeCommand({ kind: "setBudget", value: 50_000 })).toEqual({ kind: "setBudget", value: 50_000 });
+	});
+	it("sanitizes an ops command (drops malformed ops), and returns null when ops is not an array", () => {
+		const out = sanitizeCommand({ kind: "ops", ops: [{ kind: "fold", ids: ["a"] }, null, { kind: "bogus" }] });
+		expect(out).toEqual({ kind: "ops", ops: [{ kind: "fold", ids: ["a"] }] });
+		expect(sanitizeCommand({ kind: "ops", ops: "not-an-array" })).toBeNull();
+	});
+	it("validates setFolding (boolean only) and selectConductor (string | null)", () => {
+		expect(sanitizeCommand({ kind: "setFolding", value: true })).toEqual({ kind: "setFolding", value: true });
+		expect(sanitizeCommand({ kind: "setFolding", value: 1 })).toBeNull();
+		expect(sanitizeCommand({ kind: "selectConductor", id: "doorman" })).toEqual({ kind: "selectConductor", id: "doorman" });
+		expect(sanitizeCommand({ kind: "selectConductor", id: null })).toEqual({ kind: "selectConductor", id: null });
+		expect(sanitizeCommand({ kind: "selectConductor", id: 42 })).toBeNull();
+	});
+	it("returns null on a non-object or an unknown kind", () => {
+		expect(sanitizeCommand(null)).toBeNull();
+		expect(sanitizeCommand({ kind: "not-a-command" })).toBeNull();
 	});
 });
