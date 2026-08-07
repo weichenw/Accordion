@@ -454,8 +454,8 @@ export default function accordionLive(pi: ExtensionAPI, dependencies: RuntimeDep
 	// carried in every snapshot so a reconnecting client sees the current arm.
 	let foldingEnabled = false;
 
-	// The last full messages array the Truth was reconciled against (an authoritative
-	// context/agent_end snapshot, extended by message_end). pi's next `event.messages` is compared
+	// The last full messages array the Truth was reconciled against (an authoritative `context`
+	// snapshot, extended by message_end / agent_end deltas). pi's next `event.messages` is compared
 	// against it by a cheap durable-id walk to decide append-a-suffix vs. rebuild.
 	let lastMessages: PiMessage[] = [];
 	// Index-aligned content fingerprints for `lastMessages` (E1 hardening, sol P1). Computed once at
@@ -480,6 +480,19 @@ export default function accordionLive(pi: ExtensionAPI, dependencies: RuntimeDep
 	let ingressErrors = 0; // unexpected throws caught at the WS message boundary (should stay 0 — a buggy peer must not crash us)
 	const hookDurations: number[] = []; // bounded ring for the p95 readout
 	const HOOK_RING = 256;
+
+	// ── token calibration (issue #11 stage 1, ADR 0025) ──────────────────────────
+	// `pendingWireEst` is the estimate of the wire the MOST RECENT `context` hook let depart — set
+	// there because that is the one place both "what we estimated" and "what actually got sent" are
+	// known together. `maybeObserveCalibration` (called from `ingestFinishedMessage`, so it covers
+	// both `message_end` and the `agent_end` backstop) pairs it against the resulting assistant
+	// message's REAL provider usage and raw-snaps `truth.calibration`. `lastRealTokens`/
+	// `lastEstWireTokens` are the raw ingredients of the most recent observation, surfaced on
+	// `telemetryMsg()` (protocol v18) so the GUI/smoke tests can audit calibration independently of
+	// the derived multiplier.
+	let pendingWireEst: number | null = null;
+	let lastRealTokens: number | null = null;
+	let lastEstWireTokens: number | null = null;
 
 	// Most recent ExtensionContext seen on any hook. Captured so the WS connection handler
 	// (which gets no ctx of its own) can read pi's CURRENT session history at attach time — the
@@ -699,7 +712,20 @@ export default function accordionLive(pi: ExtensionAPI, dependencies: RuntimeDep
 		// long the host held the departing wire for the attached conductor's last-moment proposal on
 		// the most recent hook, and how many holds have timed out over the session. Both stay 0 while
 		// no conductor is attached (no hold is ever fired), so a no-conductor session is unchanged.
-		return { type: "telemetry", lastHookMs, maxHookMs, p95HookMs: p95HookMs(), rebuilds, hookCount, lastHoldMs: liveHost.lastHoldMs, holdTimeouts: liveHost.holdTimeouts };
+		// realTokens/estWireTokens (protocol v18, issue #11 stage 1) are the raw ingredients of the most
+		// recent calibration observation — null until the first one lands this session (cold start).
+		return {
+			type: "telemetry",
+			lastHookMs,
+			maxHookMs,
+			p95HookMs: p95HookMs(),
+			rebuilds,
+			hookCount,
+			lastHoldMs: liveHost.lastHoldMs,
+			holdTimeouts: liveHost.holdTimeouts,
+			realTokens: lastRealTokens,
+			estWireTokens: lastEstWireTokens,
+		};
 	}
 	function broadcastTelemetry(): void {
 		broadcast(telemetryMsg());
@@ -1830,7 +1856,7 @@ export default function accordionLive(pi: ExtensionAPI, dependencies: RuntimeDep
 		// `!truth`, i.e. NOT bootstrap-only): `readSessionMessages` reads pi's CURRENT
 		// `sessionManager` state, which reflects tree-nav (`session_before_tree`/`session_tree`,
 		// which this extension does not hook) the instant it happens — the only other way a
-		// tree-nav jump surfaces is the next `context`/`agent_end` hook. Gating this to
+		// tree-nav jump surfaces is the next `context` hook. Gating this to
 		// bootstrap-only would leave a client that attaches right after a tree-nav (before the
 		// next model call) looking at the stale pre-nav branch. A second client attaching mid-
 		// session can still spuriously trip `ingestMessages`' divergence check against
@@ -2154,12 +2180,71 @@ export default function accordionLive(pi: ExtensionAPI, dependencies: RuntimeDep
 	}
 
 	/**
+	 * Real provider usage fields (issue #11 stage 1) — NOT part of `core/wire.ts`'s `PiMessage` (a
+	 * lowest-common-denominator projection used across both the extension and `core/`), so read them
+	 * off the raw pi message object instead of the narrowed type.
+	 */
+	interface RealUsage {
+		input?: number;
+		output?: number;
+		cacheRead?: number;
+		cacheWrite?: number;
+		totalTokens?: number;
+	}
+
+	/**
+	 * Issue #11 stage 1 (ADR 0025): pair the wire estimate the most recent `context` hook recorded
+	 * (`pendingWireEst`) against THIS message's REAL provider usage (assistant messages only), and
+	 * raw-snap `truth.calibration = real / est` — no clamp, no smoothing (owner-approved v1 policy:
+	 * the dial always reflects the latest observation, never a running average). `pendingWireEst` is
+	 * consumed (cleared) unconditionally on every call — including a non-assistant message, an
+	 * aborted/errored reply, or one with no usable `usage` — so a departing wire that never yields a
+	 * usable pairing can't accidentally pair with a LATER, unrelated response.
+	 *
+	 * PAIRING CHOICE: `usage.input + usage.cacheRead + usage.cacheWrite` is exactly what the provider
+	 * billed as INPUT for the request that carried the departing wire `pendingWireEst` estimated.
+	 * `usage.output` is that SAME call's own reply and was never part of what was sent, so it is
+	 * deliberately EXCLUDED here — unlike pi's own `calculateContextTokens` (input+output+cacheRead+
+	 * cacheWrite, `@earendil-works/pi-coding-agent`'s compaction module), which sums output back IN
+	 * because it estimates the NEXT call's forward-looking context size, a different quantity than
+	 * "what did THIS request actually cost." This is the chosen "rigorous" pairing over the
+	 * `ctx.getContextUsage()`-based v1 fallback the design allows: it is never null (no post-
+	 * compaction gap) and isolates exactly the one request `pendingWireEst` describes, rather than
+	 * blending in `ctx.getContextUsage()`'s own trailing-message estimate.
+	 *
+	 * SMEARING CAVEAT: `est` is Truth's own block-token accounting, which — by design — excludes the
+	 * system prompt and tool-call schemas (neither belongs to any block). `real` includes them. One
+	 * multiplier therefore distributes that fixed overhead PROPORTIONALLY across every block rather
+	 * than carrying it as its own line item — `real = base + k·est` would be the honest affine model;
+	 * we ship the pure multiplier knowingly (stage 1 scope; see ADR 0025 for the stage-2 plan).
+	 */
+	function maybeObserveCalibration(msg: unknown): void {
+		if (!truth) return;
+		const est = pendingWireEst;
+		pendingWireEst = null;
+		if (est === null || est <= 0) return;
+		const m = msg as { role?: string; stopReason?: string; usage?: RealUsage } | null | undefined;
+		if (!m || m.role !== "assistant" || !m.usage) return;
+		if (m.stopReason === "aborted" || m.stopReason === "error") return;
+		const u = m.usage;
+		const input = typeof u.input === "number" ? u.input : 0;
+		const cacheRead = typeof u.cacheRead === "number" ? u.cacheRead : 0;
+		const cacheWrite = typeof u.cacheWrite === "number" ? u.cacheWrite : 0;
+		const real = input + cacheRead + cacheWrite;
+		if (real <= 0) return;
+		lastRealTokens = real;
+		lastEstWireTokens = est;
+		truth.setCalibration(real / est);
+	}
+
+	/**
 	 * Append ONE just-finished message (message_end) to the Truth immediately — this is what kills
 	 * the one-turn lag. Deduped on the message's durable ids so a re-fire or an already-appended
 	 * message is skipped (and `lastMessages` is extended so the next context prefix still matches).
 	 */
 	function ingestFinishedMessage(msg: PiMessage): void {
 		if (!truth) return;
+		maybeObserveCalibration(msg);
 		const ids = messageInfo(msg, 0).ids;
 		if (!ids.length) return;
 		if (ids.every((id) => truth!.get(id))) return; // already represented → nothing to do
@@ -2211,6 +2296,13 @@ export default function accordionLive(pi: ExtensionAPI, dependencies: RuntimeDep
 			unsubTruth = null;
 		}
 		truth = null;
+		// issue #11 stage 1: a pending/observed calibration pairing belongs to the OLD session's Truth
+		// (which just went away) — carrying it over would either mispair the new session's first
+		// assistant reply against a stale estimate, or report a stale realTokens/estWireTokens in
+		// telemetry for a session that has not yet observed anything of its own.
+		pendingWireEst = null;
+		lastRealTokens = null;
+		lastEstWireTokens = null;
 		setLastMessages([]); // clears lastMessages + lastFps together (invariant: never one without the other)
 		// E2 (external review round): folding is OPT-IN and OFF by default PER SESSION — reset the
 		// arm on every `session_start`, regardless of `_event.reason` ("startup"/"reload"/"new"/
@@ -2331,6 +2423,15 @@ export default function accordionLive(pi: ExtensionAPI, dependencies: RuntimeDep
 				if (foldingEnabled) {
 					ret = { messages: truth.serializeWire(messages) as unknown as AgentMessage[] };
 				}
+				// (c.1) issue #11 stage 1: record what THIS departing wire is estimated to cost, so the
+				// NEXT assistant reply's real usage can be paired against it (`maybeObserveCalibration`).
+				// `liveTokens()` is Truth's own accounting of what `serializeWire` just produced when
+				// folding is armed (never diverges from the wire, by the same invariant every other
+				// group/fold accounting relies on); `fullTokens()` is the raw unfolded size when folding
+				// is off (passthrough — `ret` stays undefined, `event.messages` departs verbatim).
+				// Recorded regardless of whether any client is connected, same as every other Truth
+				// bookkeeping on this hook — no disk I/O, CPU-only.
+				pendingWireEst = foldingEnabled ? truth.liveTokens() : truth.fullTokens();
 			}
 		} catch (err) {
 			hookErrors++;
@@ -2407,14 +2508,17 @@ export default function accordionLive(pi: ExtensionAPI, dependencies: RuntimeDep
 		if (msg) ingestFinishedMessage(msg);
 	});
 
-	// ── loop-end backstop: reconcile the final full array ───────────────────────
-	// `agent_end` carries the FULL message array; reconciling it catches anything message_end
-	// missed (e.g. a message that finished with no client attached) and keeps `lastMessages`
-	// authoritative for the next turn. Idempotent — the delta is usually empty by now.
+	// ── loop-end backstop: append this run's finished messages ──────────────────
+	// pi's `agent_end.messages` contains ONLY messages generated by this prompt, not the full
+	// session history. Treating it as an authoritative snapshot makes `ingestMessages` see a
+	// shorter array and rebuild Truth from just the latest run; the app then appears to lose all
+	// prior context until the next `context` hook restores the full history. Replay these run-local
+	// messages through the same idempotent delta path as `message_end` instead. Usually every id is
+	// already present; this remains a backstop for any finalized message that hook missed.
 	pi.on("agent_end", (event, ctx: ExtensionContext) => {
 		latestCtx = ctx;
 		sendStream({ type: "stream", phase: "abort", kind: "text", contentIndex: -1 });
-		ingestMessages(event.messages as unknown as PiMessage[]);
+		for (const msg of event.messages as unknown as PiMessage[]) ingestFinishedMessage(msg);
 	});
 
 	// ── suppress pi's native compaction ONLY while folding is actually armed ────
@@ -2425,9 +2529,9 @@ export default function accordionLive(pi: ExtensionAPI, dependencies: RuntimeDep
 	// suppression stays unconditional (no hard-overflow escape valve) — Accordion's own budget/fold
 	// state is the only thing standing between the session and overflow at that point, so pi's native
 	// compaction must not race it. When a native compaction DOES run because folding was off, the
-	// paired `session_compact` handler below notifies and the existing structural-divergence rebuild
-	// (`ingestMessages` → `rebuildTruth`, next `agent_end`/`message_end`/`context`) picks up the
-	// compacted history — including for an attached-but-collaborative conductor via `liveHost.dispatchResync()`.
+	// paired `session_compact` handler below immediately reconciles the Truth against the compacted
+	// history (the same `ingestMessages` → `rebuildTruth` structural-divergence path the hooks use —
+	// including conductor resync via `liveHost.dispatchResync()`) and then notifies.
 	pi.on("session_before_compact", (_event, ctx: ExtensionContext) => {
 		if (foldingEnabled) {
 			try {
@@ -2440,18 +2544,36 @@ export default function accordionLive(pi: ExtensionAPI, dependencies: RuntimeDep
 		// folding off (whether or not a client is attached) → let pi protect itself natively
 	});
 
-	// ── native compaction ran while folding was off: quietly rebuild + notify ──
+	// ── native compaction ran while folding was off: rebuild NOW + notify ──────
 	// Fires AFTER pi has actually saved a compaction (the one above did not cancel it, since folding
-	// was off). The Truth itself catches up via the normal structural-divergence path the next time
-	// `agent_end`/`message_end`/`context` reconciles pi's rewritten history (`ingestMessages` detects
-	// the mismatch and calls `rebuildTruth`, which forces every connected client to resnapshot and
-	// resyncs an attached conductor) — nothing to force here. This handler surfaces the human-facing
-	// note two ways: `ctx.ui.notify` for whoever is watching pi's own CLI/log, and — v17 — a `notice`
-	// broadcast (`core/protocol.ts`) to every connected GUI client, so a browser-served tab or a
-	// desktop window that isn't looking at pi's terminal still sees why the map just changed shape.
-	// If a client is connected, the map itself already visibly changes on the forced resnapshot; the
-	// notice is the accompanying explanation of why.
+	// was off). Reconcile the Truth HERE rather than waiting for the next `agent_end`/`message_end`/
+	// `context` pass: pi's MANUAL `/compact` path saves the compaction, emits this event, and returns
+	// with NO follow-up model call, so an attached map would otherwise show pre-compaction history
+	// until the human's next prompt — while the toast below claims it was rebuilt. `readSessionMessages`
+	// resolves the post-compaction history via pi's own `buildSessionContext()` (collapses the
+	// compaction to exactly what the next model call will see); `ingestMessages` detects the
+	// structural divergence and rebuilds (forced client resnapshot + conductor resync). For the
+	// AUTOMATIC (threshold/overflow) trigger a retry's `context` hook follows immediately and would
+	// reconcile anyway — this same-path ingest just lands moments earlier and the retry's ingest
+	// becomes a cheap no-divergence walk. Best-effort like all discovery I/O: an EMPTY read means the
+	// session state could not be resolved — keep the current Truth and let the normal reconciliation
+	// catch up, rather than rebuilding an empty map (a real post-compaction branch is never empty:
+	// it always contains at least the compaction summary entry). Not the `context` hook path, so the
+	// no-disk-I/O-on-hook invariant is untouched.
+	//
+	// The human-facing note then goes out two ways: `ctx.ui.notify` for whoever is watching pi's own
+	// CLI/log, and — v17 — a `notice` broadcast (`core/protocol.ts`) to every connected GUI client,
+	// so a browser-served tab or a desktop window that isn't looking at pi's terminal still sees why
+	// the map just changed shape. The map itself already visibly changed on the forced resnapshot;
+	// the notice is the accompanying explanation of why.
 	pi.on("session_compact", (_event, ctx: ExtensionContext) => {
+		latestCtx = ctx;
+		const msgs = readSessionMessages(ctx);
+		if (msgs.length > 0) ingestMessages(msgs);
+		// issue #11 stage 1: native compaction rewrites the session's block set out from under any
+		// in-flight `context` hook's wire estimate — drop it rather than risk pairing the NEXT
+		// assistant reply's real usage against a now-stale pre-compaction estimate.
+		pendingWireEst = null;
 		if (!attached()) return;
 		const text = "pi compacted the session natively — Accordion's map has been rebuilt to match.";
 		try {
