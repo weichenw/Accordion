@@ -126,10 +126,10 @@ recoverable, so the agent can pull the full source back with `recall` when it ne
 
 **[doorman](conductors/in-process/doorman/)** takes its idea from
 [The Token Company](https://thetokencompany.com): shrink content on the way to the model,
-before it ever costs you full price. The problem it solves is that a huge tool result lands
-inside the protected tail the moment it arrives, so the model sees it at full size on the very
-first call, which is the exact thing a folding tool is supposed to prevent. Doorman catches
-those on their way out and folds them before they reach the model at all.
+before it ever costs you full price. A huge tool result lands inside the protected tail the
+moment it arrives, so the model sees it at full size on the very first call, and doorman
+catches those on their way out and folds them before they reach the model at all. It's a cheap
+proof of concept, so don't reach for it as a real strategy.
 
 **[handoff](conductors/in-process/handoff/)** is `/handoff`, automatic. The manual version is to
 ask the agent to write a handoff document, kill the session, and paste that document into a
