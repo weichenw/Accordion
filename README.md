@@ -124,18 +124,21 @@ third is left alone, the middle band turns code reads into tree-sitter skeletons
 signature and drop the bodies, and the oldest third gets summarized. The skeletons stay
 recoverable, so the agent can pull the full source back with `recall` when it needs it.
 
-**[doorman](conductors/in-process/doorman/)** fixes one specific problem. A huge tool result
-lands inside the protected tail the moment it arrives, so the model sees it at full size on the
-very first call, which is the exact thing a folding tool is supposed to prevent. Doorman catches
-those on their way out and folds them before they ever reach the model.
+**[doorman](conductors/in-process/doorman/)** takes its idea from
+[The Token Company](https://thetokencompany.com): shrink content on the way to the model,
+before it ever costs you full price. The problem it solves is that a huge tool result lands
+inside the protected tail the moment it arrives, so the model sees it at full size on the very
+first call, which is the exact thing a folding tool is supposed to prevent. Doorman catches
+those on their way out and folds them before they reach the model at all.
 
-**[handoff](conductors/in-process/handoff/)** automates the thing people already do by hand when
-a session gets too long: ask the agent to write a handoff document, kill the session, then paste
-that document into a fresh one. It does all three without you leaving the session.
+**[handoff](conductors/in-process/handoff/)** is `/handoff`, automatic. The manual version is to
+ask the agent to write a handoff document, kill the session, and paste that document into a
+fresh one. This does all three for you without you leaving the session.
 
-**[compaction-naive](conductors/in-process/compaction-naive/)** is a deliberately lossy clone of
-`/compact`. It exists as the baseline the others get measured against, so improvements have
-something honest to beat.
+**[compaction-naive](conductors/in-process/compaction-naive/)** re-implements the `/compact` you
+already have in Claude Code, ChatGPT and everywhere else. It is the baseline the other four get
+measured against, and it makes the point that Accordion covers what exists today before it does
+anything past that.
 
 Conductors are opt-in, same as folding itself. An exclusive one shows you a consent screen
 naming which controls it takes over, and detaching converts everything it did into your own
