@@ -106,23 +106,44 @@ agent reasons over at full fidelity (the thick-bordered box below the fold line)
 
 ## The conductors
 
-Five ship today. Pick one from the header menu, or leave it on None and steer by hand.
+A conductor is a strategy for deciding what gets folded. It watches the session and proposes
+edits between turns, and every edit goes through the same rules your own hand folds do, so a
+conductor can never do something you couldn't do yourself. Five ship today. Pick one from the
+header menu, or leave it on None and steer everything by hand.
 
-| Conductor | What it does | Runs |
-|---|---|---|
-| **[thermocline](conductors/ws/thermocline/)** | Attention-gated compression under a hard budget cap. A small probe model scores how much the recent context still attends to each block, and the coldest ones get compressed first. | out of process |
-| **[triptych](conductors/ws/triptych/)** | Splits the context into thirds. The recent third stays raw, the middle turns code reads into tree-sitter skeletons (signatures kept, bodies dropped, still recoverable), the oldest third gets summarized. | out of process |
-| **[doorman](conductors/in-process/doorman/)** | Folds a huge tool result before the model ever sees it. | in process |
-| **[handoff](conductors/in-process/handoff/)** | Writes a real handoff document and folds the whole prior session behind it. | in process |
-| **[compaction-naive](conductors/in-process/compaction-naive/)** | A deliberately lossy `/compact` clone. It is the baseline the others get measured against. | in process |
+**[thermocline](conductors/ws/thermocline/)** is the strongest one so far, and the one the
+benchmark above used. It combines two earlier experiments: a small probe model that scores how
+much the recent context still attends to each block, which decides the order things get
+compressed in, and real LLM summaries, which decide how far each one gets compressed. On top of
+both it enforces a hard budget, and when your cap is genuinely impossible to hit it says so
+instead of quietly blowing past it.
+
+**[triptych](conductors/ws/triptych/)** came out of asking what actually fills a coding session
+up, which is almost always file reads. It splits the context into three bands by age: the recent
+third is left alone, the middle band turns code reads into tree-sitter skeletons that keep every
+signature and drop the bodies, and the oldest third gets summarized. The skeletons stay
+recoverable, so the agent can pull the full source back with `recall` when it needs it.
+
+**[doorman](conductors/in-process/doorman/)** fixes one specific problem. A huge tool result
+lands inside the protected tail the moment it arrives, so the model sees it at full size on the
+very first call, which is the exact thing a folding tool is supposed to prevent. Doorman catches
+those on their way out and folds them before they ever reach the model.
+
+**[handoff](conductors/in-process/handoff/)** automates the thing people already do by hand when
+a session gets too long: ask the agent to write a handoff document, kill the session, then paste
+that document into a fresh one. It does all three without you leaving the session.
+
+**[compaction-naive](conductors/in-process/compaction-naive/)** is a deliberately lossy clone of
+`/compact`. It exists as the baseline the others get measured against, so improvements have
+something honest to beat.
 
 Conductors are opt-in, same as folding itself. An exclusive one shows you a consent screen
 naming which controls it takes over, and detaching converts everything it did into your own
 edits so its work survives being removed.
 
-thermocline and triptych ship with the repo. They aren't in the npm package, so they only
-show up in the picker when you run Accordion from a checkout. Details on each are in
-**[conductors/](conductors/)**.
+thermocline and triptych run as their own process and ship with the repo. They aren't in the
+npm package, so they only show up in the picker when you run Accordion from a checkout. Details
+on each are in **[conductors/](conductors/)**.
 
 ## What works today
 
